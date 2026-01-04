@@ -41,6 +41,10 @@ pub fn create_router(state: AppState) -> Router {
         
         // 配置路由
         .route("/server_list", get(handlers::config::server_list))
+        
+        // ID 查找路由
+        .route("/generate_id", post(handlers::id_finder::generate_id))
+        .route("/search_id", post(handlers::id_finder::search_id))
         .route("/oem_list", get(handlers::config::oem_list))
         .route("/custom_args_list", get(handlers::config::custom_args_list))
         .route("/build_args_list", get(handlers::config::build_args_list))

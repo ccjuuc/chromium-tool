@@ -212,8 +212,8 @@
 <body>
     <div class="container">
         <div class="header">
-            <h1>🖼️ 图像转换服务</h1>
-            <p>支持多种图像格式转换和处理</p>
+            <h1>🛠️ Chromium 工具集</h1>
+            <p>支持图像转换、ID 查找等多种工具</p>
         </div>
 
         <div class="cards">
@@ -262,6 +262,52 @@
                     </div>
                     <button type="submit" class="btn" id="cornerBtn">添加圆角</button>
                 </form>
+            </div>
+
+            <div class="card">
+                <div class="card-title">生成 Message ID</div>
+                <form id="generateIdForm">
+                    <div class="form-group">
+                        <label for="message">消息内容</label>
+                        <input type="text" id="message" name="message" 
+                               placeholder="输入要生成 ID 的消息内容" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="meaning">Meaning (可选)</label>
+                        <input type="text" id="meaning" name="meaning" 
+                               placeholder="可选的 meaning 参数">
+                    </div>
+                    <button type="submit" class="btn" id="generateIdBtn">生成 ID</button>
+                </form>
+                <div id="messageIdResult" style="margin-top: 15px; padding: 10px; background: #f5f5f5; border-radius: 8px; display: none;">
+                    <strong>Message ID:</strong> <span id="messageIdValue"></span>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">搜索 ID</div>
+                <form id="searchIdForm">
+                    <div class="form-group">
+                        <label for="search_text">搜索文本</label>
+                        <input type="text" id="search_text" name="search_text" 
+                               placeholder="输入要搜索的中文文本" required>
+                    </div>
+                    <button type="submit" class="btn" id="searchIdBtn">搜索</button>
+                </form>
+                <div id="searchIdResult" style="margin-top: 15px; display: none;">
+                    <div style="margin-bottom: 10px;">
+                        <strong>找到的 ID:</strong>
+                        <div id="idsList" style="margin-top: 5px; max-height: 150px; overflow-y: auto; padding: 10px; background: #f5f5f5; border-radius: 8px;"></div>
+                    </div>
+                    <div style="margin-bottom: 10px;">
+                        <strong>英文消息:</strong>
+                        <div id="messagesList" style="margin-top: 5px; max-height: 150px; overflow-y: auto; padding: 10px; background: #f5f5f5; border-radius: 8px;"></div>
+                    </div>
+                    <div>
+                        <strong>GRD 匹配:</strong>
+                        <div id="grdMatchesList" style="margin-top: 5px; max-height: 200px; overflow-y: auto; padding: 10px; background: #f5f5f5; border-radius: 8px; font-family: monospace; font-size: 0.9em;"></div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -375,6 +421,110 @@
 
             return payload;
         }, 'oemBtn');
+
+        // 生成 Message ID
+        document.getElementById('generateIdForm').addEventListener('submit', async function(event) {
+            event.preventDefault();
+            const btn = document.getElementById('generateIdBtn');
+            const originalText = btn.textContent;
+            const originalHtml = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span>生成中...';
+            
+            try {
+                const message = document.getElementById('message').value;
+                const meaning = document.getElementById('meaning').value;
+                
+                const response = await fetch(`${API_BASE}/generate_id`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        message: message,
+                        meaning: meaning || null
+                    })
+                });
+                
+                const data = await response.json();
+                if (response.ok) {
+                    document.getElementById('messageIdValue').textContent = data.message_id;
+                    document.getElementById('messageIdResult').style.display = 'block';
+                    showMessage('ID 生成成功', true);
+                } else {
+                    showMessage(data.error || '生成失败', false);
+                }
+            } catch (error) {
+                showMessage(`错误: ${error.message}`, false);
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+            }
+        });
+
+        // 搜索 ID
+        document.getElementById('searchIdForm').addEventListener('submit', async function(event) {
+            event.preventDefault();
+            const btn = document.getElementById('searchIdBtn');
+            const originalText = btn.textContent;
+            const originalHtml = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span>搜索中...';
+            
+            try {
+                const searchText = document.getElementById('search_text').value;
+                
+                const response = await fetch(`${API_BASE}/search_id`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        search_text: searchText
+                    })
+                });
+                
+                const data = await response.json();
+                if (response.ok) {
+                    // 显示结果
+                    const idsList = document.getElementById('idsList');
+                    const messagesList = document.getElementById('messagesList');
+                    const grdMatchesList = document.getElementById('grdMatchesList');
+                    
+                    if (data.ids && data.ids.length > 0) {
+                        idsList.innerHTML = data.ids.map(id => `<div style="padding: 4px 0;">${id}</div>`).join('');
+                    } else {
+                        idsList.innerHTML = '<div style="color: #999;">未找到 ID</div>';
+                    }
+                    
+                    if (data.messages && data.messages.length > 0) {
+                        messagesList.innerHTML = data.messages.map(msg => `<div style="padding: 4px 0;">${msg}</div>`).join('');
+                    } else {
+                        messagesList.innerHTML = '<div style="color: #999;">未找到消息</div>';
+                    }
+                    
+                    if (data.grd_matches && data.grd_matches.length > 0) {
+                        grdMatchesList.innerHTML = data.grd_matches.map(match => 
+                            `<div style="padding: 4px 0; white-space: pre-wrap;">${escapeHtml(match)}</div>`
+                        ).join('');
+                    } else {
+                        grdMatchesList.innerHTML = '<div style="color: #999;">未找到 GRD 匹配</div>';
+                    }
+                    
+                    document.getElementById('searchIdResult').style.display = 'block';
+                    showMessage(`找到 ${data.ids?.length || 0} 个 ID`, true);
+                } else {
+                    showMessage(data.error || '搜索失败', false);
+                }
+            } catch (error) {
+                showMessage(`错误: ${error.message}`, false);
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+            }
+        });
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
 
         // 添加圆角
         handleFormSubmit('addRoundedCornersForm', '/add_rounded_corners', async (formData) => {
