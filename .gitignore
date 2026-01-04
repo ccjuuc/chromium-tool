@@ -1,0 +1,42 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.oem
+*.pkg
+*.dmg
+*.deb
+*.rpm
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+oem/theme/**/tmp_*.png
+oem_logo/tmp_*.png
+
+# Config (may contain sensitive info)
+# config.toml  # Uncomment if config contains sensitive data
+

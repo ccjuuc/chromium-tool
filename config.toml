@@ -1,0 +1,165 @@
+sign = "10.2.0.47:10839"
+
+custom_args = []
+
+build_args = [
+  "is_update=true",
+  "is_increment=true",
+  "is_sign=true",
+]
+
+[oem]
+oem_key = "current_xn_brand"
+oems = ["snow","nuctech",""]
+
+[clean]
+path = ["snow_overrides/brand_overrides"]
+out_path = ["gen/snow_overrides/build"]
+
+[git]
+addr = "git@coding.jd.com:joyme-desktop/joyme-chromium140.git"
+
+[src]
+windows = "G:/snow_108_pkg/108.0.5359.215"
+linux = "/home/snowtech/code/code/108.0.5359.215"
+macos = "/Users/ext.shangzhijie1/joyme/src"
+db = "backup.db"
+
+[dev_tools]
+windows = "E:/snow/depot_tools"
+linux = "/home/snowtech/code/132/source/depot_tools"
+macos = "/Users/ext.shangzhijie1/joyme/depot_tools"
+
+[python]
+linux = "/home/snowtech/code/132/source/depot_tools/python-bin"
+macos = "/Users/snow/code/git/depot_tools/python-bin"
+
+
+[backup_path]
+windows = "E:/snow_commit/backup"
+linux = "/home/snowtech/backup"
+macos = "/Users/snow/backup"
+
+[server]
+windows = ["10.0.10.14:3000"]
+macos = ["10.0.38.193:3000"]
+linux = ["10.2.0.239:3000"]
+db_server = "10.0.38.193:3000"
+
+[email]
+web = "10.0.38.193:3000"
+smtp = "smtp.163.com"
+from = "ccjuuc@163.com"
+password = "BVjEVanDF2jwbWjF"
+to = [
+  "ccjuuc@163.com"
+]
+
+
+[gn_default_args]
+windows = [
+  "is_debug=false",
+  "is_component_build=false",
+  "is_clang=true",
+  "is_official_build=true",
+]
+linux = [
+  "grpc_use_static_linking=true",
+  "is_official_build=true",
+  "symbol_level=1",
+  "blink_symbol_level=1",
+  "is_clang=true"
+]
+macos = [
+  "use_system_xcode=true",
+  "is_debug=false",
+  "is_component_build=false",
+  "is_clang=true",
+  "is_official_build=true",
+  "chrome_pgo_phase=0"
+]
+
+[build_steps]
+# Windows 平台构建步骤
+[build_steps.windows]
+x64 = [
+  { name = "更新代码", step_type = "git", target = "update", state = "checkout...", skip_if = "is_update=false" },
+  { name = "获取 Commit ID", step_type = "git", target = "get_commit_id", state = "start build" },
+  { name = "清理构建目录", step_type = "clean", state = "clean..." },
+  { name = "生成项目配置", step_type = "gn_gen", state = "gen project" },
+  { name = "编译 pre_build", step_type = "ninja", target = "pre_build", state = "build pre_build" },
+  { name = "编译 base", step_type = "ninja", target = "base", state = "build base" },
+  { name = "编译 chrome", step_type = "ninja", target = "chrome", state = "build chrome" },
+  { name = "构建安装包", step_type = "installer", state = "build installer" },
+  { name = "备份构建产物", step_type = "backup", state = "backup" },
+]
+x86 = [
+  { name = "更新代码", step_type = "git", target = "update", state = "checkout...", skip_if = "is_update=false" },
+  { name = "获取 Commit ID", step_type = "git", target = "get_commit_id", state = "start build" },
+  { name = "清理构建目录", step_type = "clean", state = "clean..." },
+  { name = "生成项目配置", step_type = "gn_gen", state = "gen project" },
+  { name = "编译 pre_build", step_type = "ninja", target = "pre_build", state = "build pre_build" },
+  { name = "编译 base", step_type = "ninja", target = "base", state = "build base" },
+  { name = "编译 chrome", step_type = "ninja", target = "chrome", state = "build chrome" },
+  { name = "构建安装包", step_type = "installer", state = "build installer" },
+  { name = "备份构建产物", step_type = "backup", state = "backup" },
+]
+
+# macOS 平台构建步骤
+[build_steps.macos]
+arm64 = [
+  { name = "更新代码", step_type = "git", target = "update", state = "checkout...", skip_if = "is_update=false" },
+  { name = "获取 Commit ID", step_type = "git", target = "get_commit_id", state = "start build" },
+  { name = "清理构建目录", step_type = "clean", state = "clean..." },
+  { name = "生成项目配置", step_type = "gn_gen", state = "gen project" },
+  { name = "编译 pre_build", step_type = "ninja", target = "pre_build", state = "build pre_build" },
+  { name = "编译 chrome", step_type = "ninja", target = "chrome", state = "build chrome" },
+  { name = "构建安装包", step_type = "installer", state = "build installer" },
+  { name = "备份构建产物", step_type = "backup", state = "backup" },
+]
+x64 = [
+  { name = "更新代码", step_type = "git", target = "update", state = "checkout...", skip_if = "is_update=false" },
+  { name = "获取 Commit ID", step_type = "git", target = "get_commit_id", state = "start build" },
+  { name = "清理构建目录", step_type = "clean", state = "clean..." },
+  { name = "生成项目配置", step_type = "gn_gen", state = "gen project" },
+  { name = "编译 pre_build", step_type = "ninja", target = "pre_build", state = "build pre_build" },
+  { name = "编译 chrome", step_type = "ninja", target = "chrome", state = "build chrome" },
+  { name = "构建安装包", step_type = "installer", state = "build installer" },
+  { name = "备份构建产物", step_type = "backup", state = "backup" },
+]
+
+# Linux 平台构建步骤
+[build_steps.linux]
+x64 = [
+  { name = "更新代码", step_type = "git", target = "update", state = "checkout...", skip_if = "is_update=false" },
+  { name = "获取 Commit ID", step_type = "git", target = "get_commit_id", state = "start build" },
+  { name = "清理构建目录", step_type = "clean", state = "clean..." },
+  { name = "生成项目配置", step_type = "gn_gen", state = "gen project" },
+  { name = "编译 pre_build", step_type = "ninja", target = "pre_build", state = "build pre_build" },
+  { name = "编译 base", step_type = "ninja", target = "base", state = "build base" },
+  { name = "编译 chrome", step_type = "ninja", target = "chrome", state = "build chrome" },
+  { name = "构建安装包", step_type = "installer", state = "build installer" },
+  { name = "备份构建产物", step_type = "backup", state = "backup" },
+]
+arm64 = [
+  { name = "更新代码", step_type = "git", target = "update", state = "checkout...", skip_if = "is_update=false" },
+  { name = "获取 Commit ID", step_type = "git", target = "get_commit_id", state = "start build" },
+  { name = "清理构建目录", step_type = "clean", state = "clean..." },
+  { name = "生成项目配置", step_type = "gn_gen", state = "gen project" },
+  { name = "编译 pre_build", step_type = "ninja", target = "pre_build", state = "build pre_build" },
+  { name = "编译 base", step_type = "ninja", target = "base", state = "build base" },
+  { name = "编译 chrome", step_type = "ninja", target = "chrome", state = "build chrome" },
+  { name = "构建安装包", step_type = "installer", state = "build installer" },
+  { name = "备份构建产物", step_type = "backup", state = "backup" },
+]
+arm = [
+  { name = "更新代码", step_type = "git", target = "update", state = "checkout...", skip_if = "is_update=false" },
+  { name = "获取 Commit ID", step_type = "git", target = "get_commit_id", state = "start build" },
+  { name = "清理构建目录", step_type = "clean", state = "clean..." },
+  { name = "生成项目配置", step_type = "gn_gen", state = "gen project" },
+  { name = "编译 pre_build", step_type = "ninja", target = "pre_build", state = "build pre_build" },
+  { name = "编译 base", step_type = "ninja", target = "base", state = "build base" },
+  { name = "编译 chrome", step_type = "ninja", target = "chrome", state = "build chrome" },
+  { name = "构建安装包", step_type = "installer", state = "build installer" },
+  { name = "备份构建产物", step_type = "backup", state = "backup" },
+]

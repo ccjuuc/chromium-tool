@@ -1,0 +1,156 @@
+use std::path::Path;
+use anyhow::{Context, Result};
+use std::process::Command;
+use crate::util::retry::retry_async;
+
+pub async fn update_code(
+    src_path: &Path,
+    branch: &str,
+    commit_id: Option<&str>,
+) -> Result<()> {
+    // git stash
+    tracing::info!("📋 执行命令: git stash");
+    tracing::info!("📁 工作目录: {}", src_path.display());
+    let start_time = std::time::Instant::now();
+    let stash_output = Command::new("git")
+        .arg("stash")
+        .current_dir(src_path)
+        .output()
+        .context("Failed to stash changes")?;
+    let duration = start_time.elapsed();
+    let exit_code = stash_output.status.code().unwrap_or(-1);
+    
+    if !stash_output.stdout.is_empty() {
+        tracing::info!("✅ 标准输出:\n{}", String::from_utf8_lossy(&stash_output.stdout));
+    }
+    if !stash_output.stderr.is_empty() && !stash_output.status.success() {
+        tracing::warn!("⚠️  标准错误:\n{}", String::from_utf8_lossy(&stash_output.stderr));
+    }
+    tracing::info!("⏱️  执行时间: {:.2} 秒, 退出码: {}\n", duration.as_secs_f64(), exit_code);
+    
+    // git checkout commit_id (if provided)
+    if let Some(commit) = commit_id {
+        tracing::info!("📋 执行命令: git checkout {}", commit);
+        tracing::info!("📁 工作目录: {}", src_path.display());
+        let start_time = std::time::Instant::now();
+        let checkout_output = Command::new("git")
+            .arg("checkout")
+            .arg(commit)
+            .current_dir(src_path)
+            .output()
+            .context("Failed to checkout commit")?;
+        let duration = start_time.elapsed();
+        let exit_code = checkout_output.status.code().unwrap_or(-1);
+        
+        if !checkout_output.stdout.is_empty() {
+            tracing::info!("✅ 标准输出:\n{}", String::from_utf8_lossy(&checkout_output.stdout));
+        }
+        if !checkout_output.stderr.is_empty() {
+            if checkout_output.status.success() {
+                tracing::info!("ℹ️  标准输出:\n{}", String::from_utf8_lossy(&checkout_output.stderr));
+            } else {
+                tracing::error!("❌ 标准错误:\n{}", String::from_utf8_lossy(&checkout_output.stderr));
+                return Err(anyhow::anyhow!(
+                    "git checkout {} failed with exit code {}",
+                    commit,
+                    exit_code
+                ));
+            }
+        }
+        tracing::info!("⏱️  执行时间: {:.2} 秒, 退出码: {}\n", duration.as_secs_f64(), exit_code);
+    }
+    
+    // git checkout branch
+    tracing::info!("📋 执行命令: git checkout {}", branch);
+    tracing::info!("📁 工作目录: {}", src_path.display());
+    let start_time = std::time::Instant::now();
+    let checkout_output = Command::new("git")
+        .arg("checkout")
+        .arg(branch)
+        .current_dir(src_path)
+        .output()
+        .context("Failed to checkout branch")?;
+    let duration = start_time.elapsed();
+    let exit_code = checkout_output.status.code().unwrap_or(-1);
+    
+    if !checkout_output.stdout.is_empty() {
+        tracing::info!("✅ 标准输出:\n{}", String::from_utf8_lossy(&checkout_output.stdout));
+    }
+    if !checkout_output.stderr.is_empty() {
+        if checkout_output.status.success() {
+            tracing::info!("ℹ️  标准输出:\n{}", String::from_utf8_lossy(&checkout_output.stderr));
+        } else {
+            tracing::error!("❌ 标准错误:\n{}", String::from_utf8_lossy(&checkout_output.stderr));
+            return Err(anyhow::anyhow!(
+                "git checkout {} failed with exit code {}",
+                branch,
+                exit_code
+            ));
+        }
+    }
+    tracing::info!("⏱️  执行时间: {:.2} 秒, 退出码: {}\n", duration.as_secs_f64(), exit_code);
+    
+    // git pull with retry
+    tracing::info!("📋 执行命令: git pull (带重试)");
+    tracing::info!("📁 工作目录: {}", src_path.display());
+    let pull_start = std::time::Instant::now();
+    retry_async(|| async {
+        let output = Command::new("git")
+            .arg("pull")
+            .current_dir(src_path)
+            .output()?;
+        
+        let exit_code = output.status.code().unwrap_or(-1);
+        if !output.stdout.is_empty() {
+            tracing::info!("✅ 标准输出:\n{}", String::from_utf8_lossy(&output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            if output.status.success() {
+                tracing::info!("ℹ️  标准输出:\n{}", String::from_utf8_lossy(&output.stderr));
+            } else {
+                tracing::error!("❌ 标准错误:\n{}", String::from_utf8_lossy(&output.stderr));
+            }
+        }
+        
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Git pull failed with exit code {}", exit_code))
+        }
+    })
+    .await
+    .context("Failed to pull changes")?;
+    let pull_duration = pull_start.elapsed();
+    tracing::info!("⏱️  执行时间: {:.2} 秒\n", pull_duration.as_secs_f64());
+    
+    Ok(())
+}
+
+pub async fn get_commit_id(src_path: &Path) -> Result<String> {
+    tracing::info!("📋 执行命令: git rev-parse HEAD");
+    tracing::info!("📁 工作目录: {}", src_path.display());
+    
+    let output = Command::new("git")
+        .args(&["rev-parse", "HEAD"])
+        .current_dir(src_path)
+        .output()
+        .context("Failed to get commit id")?;
+    
+    let exit_code = output.status.code().unwrap_or(-1);
+    
+    if !output.status.success() {
+        if !output.stderr.is_empty() {
+            tracing::error!("❌ 标准错误:\n{}", String::from_utf8_lossy(&output.stderr));
+        }
+        return Err(anyhow::anyhow!(
+            "Failed to get commit id, exit code: {}",
+            exit_code
+        ));
+    }
+    
+    let commit_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    tracing::info!("✅ Commit ID: {}\n", commit_id);
+    
+    Ok(commit_id)
+}
+

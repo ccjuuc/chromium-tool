@@ -1,0 +1,1095 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>打包构建服务 - Chromium Tool</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header h1 {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #667eea;
+            margin: 0;
+        }
+
+        .nav-link {
+            display: inline-block;
+            padding: 10px 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 500;
+            transition: transform 0.2s ease;
+        }
+
+        .nav-link:hover {
+            transform: translateY(-2px);
+        }
+
+        .card {
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+        }
+
+        .card-title {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #667eea;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .card-title::before {
+            content: '';
+            width: 4px;
+            height: 24px;
+            background: #667eea;
+            border-radius: 2px;
+        }
+
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .form-group label {
+            font-weight: 500;
+            margin-bottom: 8px;
+            color: #555;
+            font-size: 0.95rem;
+        }
+
+        .form-group input,
+        .form-group select {
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.3s ease;
+            background: #fafafa;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #667eea;
+            background: white;
+        }
+
+        .checkbox-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            margin-top: 10px;
+        }
+
+        .checkbox-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: #f5f5f5;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .checkbox-item:hover {
+            background: #e8e8e8;
+        }
+
+        .checkbox-item input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+
+        .checkbox-item label {
+            cursor: pointer;
+            margin: 0;
+            user-select: none;
+        }
+
+        .checkbox-item.disabled {
+            opacity: 0.5;
+            text-decoration: line-through;
+        }
+
+        .btn {
+            padding: 14px 32px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            margin-top: 20px;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .table-container {
+            overflow-x: auto;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+        }
+
+        thead {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        th {
+            padding: 16px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.9rem;
+            white-space: nowrap;
+        }
+
+        td {
+            padding: 14px 16px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+
+        tbody tr {
+            transition: background-color 0.2s ease;
+        }
+
+        tbody tr:hover {
+            background-color: #f8f9fa;
+        }
+
+        tbody tr:last-child td {
+            border-bottom: none;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        .status-success {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .status-failed {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .status-building {
+            background: #dbeafe;
+            color: #1e40af;
+        }
+
+        .btn-delete {
+            padding: 6px 12px;
+            background: #ef4444;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+
+        .btn-delete:hover {
+            background: #dc2626;
+        }
+
+        .toast {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 16px 24px;
+            border-radius: 8px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            display: none;
+            z-index: 1000;
+            min-width: 300px;
+            text-align: center;
+            font-weight: 500;
+            animation: slideDown 0.3s ease;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateX(-50%) translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(-50%) translateY(0);
+            }
+        }
+
+        .toast.success {
+            background: #10b981;
+            color: white;
+        }
+
+        .toast.error {
+            background: #ef4444;
+            color: white;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        @media (max-width: 768px) {
+            .form-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .header {
+                flex-direction: column;
+                gap: 15px;
+                text-align: center;
+            }
+
+            .table-container {
+                font-size: 0.85rem;
+            }
+
+            th, td {
+                padding: 10px 8px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📦 打包构建服务</h1>
+            <a href="/oem" class="nav-link">图像转换</a>
+        </div>
+
+        <div class="card">
+            <div class="card-title">构建配置</div>
+            <form id="buildPackageForm">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="branch">分支</label>
+                        <select id="branch" name="branch" required>
+                            <option value="main">main</option>
+                            <option value="develop">develop</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="commit_id">Commit ID (可选)</label>
+                        <input type="text" id="commit_id" name="commit_id" placeholder="留空使用最新提交">
+                    </div>
+                    <div class="form-group">
+                        <label for="pkg_flag">包标记</label>
+                        <input type="text" id="pkg_flag" name="pkg_flag" placeholder="标记包版本">
+                    </div>
+                    <div class="form-group">
+                        <label for="email">邮箱 (可选)</label>
+                        <input type="email" id="email" name="email" placeholder="接收通知的邮箱">
+                    </div>
+                    <div class="form-group">
+                        <label id="oem_key" for="oem">OEM</label>
+                        <select id="oem" name="oem"></select>
+                    </div>
+                    <div class="form-group">
+                        <label for="server">服务器</label>
+                        <select id="server" name="server" required></select>
+                    </div>
+                    <div class="form-group">
+                        <label>架构选择</label>
+                        <div id="arch_container" class="checkbox-group"></div>
+                        <small style="color: #666; margin-top: 5px; display: block;">根据选择的平台显示可用架构</small>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>自定义参数</label>
+                    <div id="custom_args_container" class="checkbox-group"></div>
+                </div>
+
+                <div class="form-group">
+                    <label>构建参数</label>
+                    <div id="build_args_container" class="checkbox-group"></div>
+                </div>
+
+                <button type="submit" class="btn" id="buildBtn">开始构建</button>
+            </form>
+        </div>
+
+        <div class="card">
+            <div class="card-title">任务列表</div>
+            <div class="table-container">
+                <table id="taskTable">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>开始时间</th>
+                            <th>结束时间</th>
+                            <th>分支</th>
+                            <th>OEM</th>
+                            <th>Commit ID</th>
+                            <th>已签名</th>
+                            <th>增量</th>
+                            <th>标记</th>
+                            <th>安装包</th>
+                            <th>状态</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div id="message" class="toast"></div>
+
+    <!-- 日志查看模态框 -->
+    <div id="logModal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 90%; max-height: 90vh;">
+            <div class="modal-header">
+                <h2>构建日志 - 任务 #<span id="logTaskId"></span></h2>
+                <span class="modal-close" onclick="closeLogModal()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div id="logContainer" style="
+                    background: #1e1e1e;
+                    color: #d4d4d4;
+                    font-family: 'Courier New', monospace;
+                    font-size: 13px;
+                    padding: 15px;
+                    border-radius: 4px;
+                    overflow-y: auto;
+                    max-height: 70vh;
+                    white-space: pre-wrap;
+                    word-wrap: break-word;
+                "></div>
+            </div>
+        </div>
+    </div>
+
+    <style>
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+            overflow: auto;
+        }
+        .modal-content {
+            background-color: #fefefe;
+            margin: 5% auto;
+            padding: 0;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            width: 90%;
+            max-width: 1200px;
+        }
+        .modal-header {
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 8px 8px 0 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .modal-header h2 {
+            margin: 0;
+            font-size: 1.5rem;
+        }
+        .modal-close {
+            color: white;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+            line-height: 1;
+        }
+        .modal-close:hover {
+            opacity: 0.7;
+        }
+        .modal-body {
+            padding: 20px;
+        }
+        .btn-view-log {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .btn-view-log:hover {
+            background: #5568d3;
+        }
+        #logContainer .progress-line {
+            color: #4ec9b0;
+        }
+    </style>
+
+    <script>
+        const API_BASE = window.location.origin;
+
+        // 工具函数
+        function showMessage(message, isSuccess) {
+            const messageDiv = document.getElementById('message');
+            messageDiv.textContent = message;
+            messageDiv.className = `toast ${isSuccess ? 'success' : 'error'}`;
+            messageDiv.style.display = 'block';
+            setTimeout(() => {
+                messageDiv.style.display = 'none';
+            }, 5000);
+        }
+
+        function setLoading(buttonId, isLoading) {
+            const btn = document.getElementById(buttonId);
+            if (isLoading) {
+                btn.disabled = true;
+                btn.innerHTML = '<span class="loading"></span>构建中...';
+            } else {
+                btn.disabled = false;
+                btn.textContent = '开始构建';
+            }
+        }
+
+        function getStatusClass(state) {
+            if (state === 'success') return 'status-success';
+            if (state === 'failed') return 'status-failed';
+            if (state.includes('build') || state.includes('gen')) return 'status-building';
+            return '';
+        }
+
+        // 获取任务列表
+        async function fetchTasks() {
+            try {
+                const response = await fetch(`${API_BASE}/task_list`);
+                const data = await response.json();
+                updateTaskTable(data.tasks || []);
+            } catch (error) {
+                console.error('Error fetching tasks:', error);
+            }
+        }
+
+        function updateTaskTable(tasks) {
+            const tbody = document.querySelector('#taskTable tbody');
+            tbody.innerHTML = '';
+
+            if (tasks.length === 0) {
+                const row = tbody.insertRow();
+                const cell = row.insertCell();
+                cell.colSpan = 12;
+                cell.textContent = '暂无任务';
+                cell.style.textAlign = 'center';
+                cell.style.padding = '40px';
+                cell.style.color = '#999';
+                return;
+            }
+
+            // 按父子关系组织任务
+            const rootTasks = tasks.filter(t => !t.parent_id);
+            const childTasksMap = new Map();
+            tasks.forEach(task => {
+                if (task.parent_id) {
+                    if (!childTasksMap.has(task.parent_id)) {
+                        childTasksMap.set(task.parent_id, []);
+                    }
+                    childTasksMap.get(task.parent_id).push(task);
+                }
+            });
+
+            // 渲染任务行
+            function renderTaskRow(task, isChild = false) {
+                const row = tbody.insertRow();
+                if (isChild) {
+                    row.style.backgroundColor = '#f8f9fa';
+                    row.style.opacity = '0.9';
+                }
+                
+                // ID 列：显示父子关系
+                const idCell = row.insertCell();
+                if (task.parent_id) {
+                    idCell.innerHTML = `<span style="color: #999; margin-right: 4px;">└─</span> ${task.id}`;
+                } else {
+                    // 检查是否有子任务
+                    const hasChildren = childTasksMap.has(task.id);
+                    if (hasChildren) {
+                        idCell.innerHTML = `<strong>${task.id}</strong> <span style="color: #667eea; font-size: 0.85em;">(父任务)</span>`;
+                    } else {
+                        idCell.textContent = task.id || '-';
+                    }
+                }
+                
+                row.insertCell().textContent = task.start_time || '-';
+                row.insertCell().textContent = task.end_time || '-';
+                row.insertCell().textContent = task.branch_name || '-';
+                row.insertCell().textContent = task.oem_name || '-';
+                
+                // Commit ID 列：如果父任务的 commit_id 为空，从子任务中获取
+                let commitId = task.commit_id;
+                if (!commitId && !task.parent_id) {
+                    // 父任务没有 commit_id，尝试从子任务中获取
+                    const childTasks = childTasksMap.get(task.id) || [];
+                    const childWithCommitId = childTasks.find(t => t.commit_id && t.commit_id.trim() !== '');
+                    if (childWithCommitId) {
+                        commitId = childWithCommitId.commit_id;
+                    }
+                }
+                // 显示 commit_id（如果为空则显示 '-'，否则显示前8位）
+                const commitIdText = commitId && commitId.trim() !== '' ? commitId.substring(0, 8) : '-';
+                row.insertCell().textContent = commitIdText;
+                
+                const signedCell = row.insertCell();
+                signedCell.textContent = task.is_signed ? '✓' : '✗';
+                
+                row.insertCell().textContent = task.is_increment ? '✓' : '✗';
+                
+                // 标记列：显示架构信息
+                const pkgFlagCell = row.insertCell();
+                let pkgFlagText = task.pkg_flag || '-';
+                if (task.architecture && !pkgFlagText.includes(`[${task.architecture}]`)) {
+                    pkgFlagText = `${pkgFlagText} [${task.architecture}]`;
+                }
+                pkgFlagCell.textContent = pkgFlagText;
+
+                const installerCell = row.insertCell();
+                if (task.installer && task.installer !== "") {
+                    try {
+                        const installers = JSON.parse(task.installer);
+                        installers.forEach((installer, index) => {
+                            if (index > 0) installerCell.appendChild(document.createElement('br'));
+                            const link = document.createElement('a');
+                            const storagePath = task.storage_path?.includes('backup') 
+                                ? task.storage_path.substring(task.storage_path.indexOf('backup') + 7)
+                                : task.storage_path || '';
+                            link.href = `${API_BASE}/download/${storagePath}/${installer[0]}`;
+                            link.textContent = `${installer[0]} (${installer[1]?.substring(0, 8) || 'N/A'})`;
+                            link.target = "_blank";
+                            link.style.color = '#667eea';
+                            link.style.textDecoration = 'none';
+                            installerCell.appendChild(link);
+                        });
+                    } catch (e) {
+                        installerCell.textContent = task.installer;
+                    }
+                } else {
+                    installerCell.textContent = '-';
+                }
+
+                const stateCell = row.insertCell();
+                const stateBadge = document.createElement('span');
+                stateBadge.textContent = task.state || '-';
+                stateBadge.className = `status-badge ${getStatusClass(task.state || '')}`;
+                stateCell.appendChild(stateBadge);
+
+                const actionCell = row.insertCell();
+                
+                // 查看日志按钮：只有在非 pending 状态时才显示
+                const taskState = (task.state || '').toLowerCase();
+                const shouldShowLog = taskState !== 'pending' && taskState !== '';
+                if (shouldShowLog) {
+                    const viewLogBtn = document.createElement('button');
+                    viewLogBtn.textContent = '查看日志';
+                    viewLogBtn.className = 'btn-view-log';
+                    viewLogBtn.style.marginRight = '8px';
+                    viewLogBtn.onclick = () => showTaskLog(task.id);
+                    actionCell.appendChild(viewLogBtn);
+                }
+                
+                // 删除按钮：只有父任务（没有 parent_id）才显示
+                if (!task.parent_id) {
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.textContent = '删除';
+                    deleteBtn.className = 'btn-delete';
+                    deleteBtn.onclick = async () => {
+                        if (confirm('确定要删除这个任务吗？删除父任务将同时删除所有子任务。')) {
+                            await deleteTask(task.id, task.server);
+                            fetchTasks();
+                        }
+                    };
+                    actionCell.appendChild(deleteBtn);
+                }
+            }
+            
+            // 渲染所有根任务及其子任务
+            rootTasks.forEach(parentTask => {
+                renderTaskRow(parentTask, false);
+                
+                // 渲染该父任务的所有子任务
+                const childTasks = childTasksMap.get(parentTask.id) || [];
+                childTasks.forEach(childTask => {
+                    renderTaskRow(childTask, true);
+                });
+            });
+        }
+
+        async function deleteTask(taskId, server) {
+            try {
+                const serverUrl = server ? `http://${server}` : API_BASE;
+                const response = await fetch(`${serverUrl}/delete_task`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task_id: taskId })
+                });
+
+                if (response.ok) {
+                    showMessage('任务删除成功', true);
+                } else {
+                    showMessage('删除失败', false);
+                }
+            } catch (error) {
+                showMessage(`错误: ${error.message}`, false);
+            }
+        }
+
+        // 获取服务器列表
+        async function fetchServerList() {
+            try {
+                const response = await fetch(`${API_BASE}/server_list`);
+                const data = await response.json();
+                const serverSelect = document.getElementById('server');
+                serverSelect.innerHTML = '';
+
+                let firstServer = '';
+                for (const platform in data) {
+                    if (platform === 'db_server') continue;
+                    const optgroup = document.createElement('optgroup');
+                    optgroup.label = platform.charAt(0).toUpperCase() + platform.slice(1);
+                    if (Array.isArray(data[platform])) {
+                        data[platform].forEach(server => {
+                            const option = document.createElement('option');
+                            option.value = `${platform}-${server}`;
+                            option.textContent = server;
+                            optgroup.appendChild(option);
+                            if (!firstServer) firstServer = option.value;
+                        });
+                    }
+                    serverSelect.appendChild(optgroup);
+                }
+                if (firstServer) serverSelect.value = firstServer;
+                
+                // 服务器选择改变时更新架构选项
+                serverSelect.addEventListener('change', updateArchOptions);
+                updateArchOptions(); // 初始化架构选项
+            } catch (error) {
+                console.error('Error fetching server list:', error);
+            }
+        }
+
+        // 根据平台更新架构选项
+        function updateArchOptions() {
+            const serverSelect = document.getElementById('server');
+            const serverValue = serverSelect.value;
+            if (!serverValue) return;
+            
+            const [platform] = serverValue.split('-');
+            const container = document.getElementById('arch_container');
+            container.innerHTML = '';
+            
+            // 根据平台显示可用的架构
+            const architectures = {
+                'windows': [
+                    { value: 'x64', label: 'x64 (64位)' },
+                    { value: 'x86', label: 'x86 (32位)' }
+                ],
+                'macos': [
+                    { value: 'arm64', label: 'arm64 (Apple Silicon)' },
+                    { value: 'x64', label: 'x64 (Intel)' }
+                ],
+                'linux': [
+                    { value: 'x64', label: 'x64 (64位)' },
+                    { value: 'arm64', label: 'arm64' },
+                    { value: 'arm', label: 'arm' }
+                ]
+            };
+            
+            const archs = architectures[platform] || [];
+            if (archs.length === 0) return;
+            
+            archs.forEach((arch, index) => {
+                const item = document.createElement('div');
+                item.className = 'checkbox-item';
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.id = `arch_${arch.value}`;
+                checkbox.name = 'architectures';
+                checkbox.value = arch.value;
+                // 默认选中第一个架构
+                if (index === 0) checkbox.checked = true;
+                const label = document.createElement('label');
+                label.htmlFor = `arch_${arch.value}`;
+                label.textContent = arch.label;
+                item.appendChild(checkbox);
+                item.appendChild(label);
+                container.appendChild(item);
+            });
+        }
+
+        // 获取 OEM 列表
+        async function fetchOemList() {
+            try {
+                const response = await fetch(`${API_BASE}/oem_list`);
+                const data = await response.json();
+                const oemSelect = document.getElementById('oem');
+                const oemKeyLabel = document.getElementById('oem_key');
+
+                oemKeyLabel.onclick = () => {
+                    oemKeyLabel.classList.toggle('disabled');
+                };
+
+                if (data.oem_key && data.oems) {
+                    oemKeyLabel.textContent = `${data.oem_key}:`;
+                    data.oems.forEach(item => {
+                        const option = document.createElement('option');
+                        option.value = item;
+                        option.textContent = item || '(空)';
+                        oemSelect.appendChild(option);
+                    });
+                }
+            } catch (error) {
+                console.error('Error fetching OEM list:', error);
+            }
+        }
+
+        // 获取自定义参数列表
+        async function fetchCustomList() {
+            try {
+                const response = await fetch(`${API_BASE}/custom_args_list`);
+                const data = await response.json();
+                const container = document.getElementById('custom_args_container');
+
+                data.forEach(custom => {
+                    if (!custom.includes('=')) return;
+                    const [key, value] = custom.split('=');
+                    if (!key || !value) return;
+
+                    const item = document.createElement('div');
+                    item.className = 'checkbox-item';
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.id = `custom_${key}`;
+                    checkbox.name = key;
+                    checkbox.checked = value === 'true';
+                    const label = document.createElement('label');
+                    label.htmlFor = `custom_${key}`;
+                    label.textContent = key;
+                    item.appendChild(checkbox);
+                    item.appendChild(label);
+                    container.appendChild(item);
+                });
+            } catch (error) {
+                console.error('Error fetching custom args:', error);
+            }
+        }
+
+        // 获取构建参数列表
+        async function fetchBuildArgsList() {
+            try {
+                const response = await fetch(`${API_BASE}/build_args_list`);
+                const data = await response.json();
+                const container = document.getElementById('build_args_container');
+
+                data.forEach(build => {
+                    if (!build.includes('=')) return;
+                    const [key, value] = build.split('=');
+                    if (!key || !value) return;
+
+                    const item = document.createElement('div');
+                    item.className = 'checkbox-item';
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.id = `build_${key}`;
+                    checkbox.name = key;
+                    checkbox.checked = value === 'true';
+                    const label = document.createElement('label');
+                    label.htmlFor = `build_${key}`;
+                    label.textContent = key;
+                    label.onclick = () => {
+                        label.classList.toggle('disabled');
+                    };
+                    item.appendChild(checkbox);
+                    item.appendChild(label);
+                    container.appendChild(item);
+                });
+            } catch (error) {
+                console.error('Error fetching build args:', error);
+            }
+        }
+
+        // 表单提交
+        document.getElementById('buildPackageForm').addEventListener('submit', async function(event) {
+            event.preventDefault();
+            setLoading('buildBtn', true);
+
+            try {
+                const formData = new FormData(event.target);
+                const oemKeyLabel = document.getElementById('oem_key');
+                const oemKey = oemKeyLabel.classList.contains('disabled') 
+                    ? '' 
+                    : oemKeyLabel.textContent.replace(':', '');
+                const oemName = formData.get('oem') || '';
+                const serverData = formData.get('server');
+                const [platform, server] = serverData.split('-');
+
+                // 收集自定义参数
+                const customArgs = [];
+                document.querySelectorAll('#custom_args_container input[type="checkbox"]').forEach(input => {
+                    customArgs.push(`${input.name}=${input.checked}`);
+                });
+
+                // 收集构建参数
+                let isUpdate = false, isIncrement = true, isSigned = true;
+                document.querySelectorAll('#build_args_container input[type="checkbox"]').forEach(input => {
+                    const label = document.querySelector(`label[for="${input.id}"]`);
+                    if (label && !label.classList.contains('disabled')) {
+                        if (input.name === 'is_update') isUpdate = input.checked;
+                        else if (input.name === 'is_increment') isIncrement = input.checked;
+                        else if (input.name === 'is_signed') isSigned = input.checked;
+                    }
+                });
+
+                // 收集选中的架构
+                const selectedArchs = [];
+                document.querySelectorAll('#arch_container input[type="checkbox"]:checked').forEach(checkbox => {
+                    selectedArchs.push(checkbox.value);
+                });
+
+                if (selectedArchs.length === 0) {
+                    showMessage('请至少选择一个架构', false);
+                    setLoading('buildBtn', false);
+                    return;
+                }
+
+                // 根据架构确定 is_x64（用于向后兼容字段）
+                const isX64 = selectedArchs.some(arch => arch === 'x64' || arch === 'x86');
+                
+                // 一次性发送所有架构
+                const payload = {
+                    branch: formData.get('branch'),
+                    commit_id: formData.get('commit_id') || null,
+                    oem_name: (oemKey && oemName) ? `${oemKey}=${oemName}` : '',
+                    platform: platform,
+                    is_increment: isIncrement,
+                    is_update: isUpdate,
+                    is_x64: isX64,
+                    architectures: selectedArchs,  // 发送架构列表
+                    is_signed: isSigned,
+                    server: server,
+                    pkg_flag: formData.get('pkg_flag') || '',
+                    email: formData.get('email') || null,
+                    custom_args: customArgs.length > 0 ? customArgs : null
+                };
+
+                try {
+                    const serverUrl = `http://${server}`;
+                    const response = await fetch(`${serverUrl}/build_package`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    const responseData = await response.text();
+                    if (response.ok) {
+                        showMessage(responseData || '构建任务已启动', true);
+                        fetchTasks();
+                    } else {
+                        showMessage(responseData || '构建启动失败', false);
+                    }
+                } catch (error) {
+                    showMessage(`错误: ${error.message}`, false);
+                }
+            } catch (error) {
+                showMessage(`错误: ${error.message}`, false);
+            } finally {
+                setLoading('buildBtn', false);
+            }
+        });
+
+        // WebSocket 连接管理
+        let wsConnections = new Map();
+        
+        // 显示任务日志
+        function showTaskLog(taskId) {
+            const modal = document.getElementById('logModal');
+            const taskIdSpan = document.getElementById('logTaskId');
+            const logContainer = document.getElementById('logContainer');
+            
+            taskIdSpan.textContent = taskId;
+            logContainer.innerHTML = '<div style="color: #888;">正在连接...</div>';
+            modal.style.display = 'block';
+            
+            // 关闭之前的连接
+            if (wsConnections.has(taskId)) {
+                wsConnections.get(taskId).close();
+            }
+            
+            // 建立 WebSocket 连接
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws/task_log/${taskId}`;
+            const ws = new WebSocket(wsUrl);
+            
+            let lastProgressLine = null;
+            
+            ws.onopen = () => {
+                logContainer.innerHTML = '<div style="color: #4ec9b0;">已连接，等待日志...</div>';
+            };
+            
+            ws.onmessage = (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    if (message.log) {
+                        if (message.is_progress) {
+                            // 进度行：更新最后一行
+                            if (lastProgressLine) {
+                                lastProgressLine.textContent = message.log;
+                            } else {
+                                const progressDiv = document.createElement('div');
+                                progressDiv.className = 'progress-line';
+                                progressDiv.textContent = message.log;
+                                logContainer.appendChild(progressDiv);
+                                lastProgressLine = progressDiv;
+                            }
+                        } else {
+                            // 普通行：追加新行
+                            lastProgressLine = null;
+                            const logDiv = document.createElement('div');
+                            logDiv.textContent = message.log;
+                            logContainer.appendChild(logDiv);
+                            // 自动滚动到底部
+                            logContainer.scrollTop = logContainer.scrollHeight;
+                        }
+                    }
+                } catch (e) {
+                    console.error('解析日志消息失败:', e);
+                }
+            };
+            
+            ws.onerror = (error) => {
+                logContainer.innerHTML += '<div style="color: #f48771;">连接错误</div>';
+                console.error('WebSocket 错误:', error);
+            };
+            
+            ws.onclose = () => {
+                logContainer.innerHTML += '<div style="color: #888;">连接已关闭</div>';
+                wsConnections.delete(taskId);
+            };
+            
+            wsConnections.set(taskId, ws);
+        }
+        
+        // 关闭日志模态框
+        function closeLogModal() {
+            const modal = document.getElementById('logModal');
+            modal.style.display = 'none';
+            
+            // 关闭所有 WebSocket 连接
+            wsConnections.forEach((ws, taskId) => {
+                ws.close();
+            });
+            wsConnections.clear();
+        }
+        
+        // 点击模态框外部关闭
+        window.onclick = function(event) {
+            const modal = document.getElementById('logModal');
+            if (event.target === modal) {
+                closeLogModal();
+            }
+        }
+        
+        // 初始化
+        document.addEventListener('DOMContentLoaded', () => {
+            fetchTasks();
+            fetchServerList();
+            fetchOemList();
+            fetchCustomList();
+            fetchBuildArgsList();
+            setInterval(fetchTasks, 5000);  // 每5秒刷新一次任务列表
+        });
+    </script>
+</body>
+</html>

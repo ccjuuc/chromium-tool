@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>图像转换服务 - Chromium Tool</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 40px;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+
+        .header p {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 50px rgba(0,0,0,0.15);
+        }
+
+        .card-title {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #667eea;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .card-title::before {
+            content: '';
+            width: 4px;
+            height: 24px;
+            background: #667eea;
+            border-radius: 2px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            font-weight: 500;
+            margin-bottom: 8px;
+            color: #555;
+            font-size: 0.95rem;
+        }
+
+        .form-group input[type="file"],
+        .form-group input[type="text"],
+        .form-group select {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.3s ease;
+            background: #fafafa;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #667eea;
+            background: white;
+        }
+
+        .form-group input[type="file"] {
+            padding: 10px;
+            cursor: pointer;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 14px 24px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            margin-top: 10px;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .toast {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 16px 24px;
+            border-radius: 8px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            display: none;
+            z-index: 1000;
+            min-width: 300px;
+            text-align: center;
+            font-weight: 500;
+            animation: slideDown 0.3s ease;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateX(-50%) translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(-50%) translateY(0);
+            }
+        }
+
+        .toast.success {
+            background: #10b981;
+            color: white;
+        }
+
+        .toast.error {
+            background: #ef4444;
+            color: white;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        @media (max-width: 768px) {
+            .cards {
+                grid-template-columns: 1fr;
+            }
+
+            .header h1 {
+                font-size: 2rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🖼️ 图像转换服务</h1>
+            <p>支持多种图像格式转换和处理</p>
+        </div>
+
+        <div class="cards">
+            <div class="card">
+                <div class="card-title">格式转换</div>
+                <form id="convertImageForm">
+                    <div class="form-group">
+                        <label for="logo_path">原图文件 (PNG/SVG)</label>
+                        <input type="file" id="logo_path" name="logo_path" accept=".png,.svg,.jpg,.jpeg" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="output_path">保存名称</label>
+                        <input type="text" id="output_path" name="output_path" 
+                               placeholder="例如: output.ico, icon.png" required>
+                    </div>
+                    <button type="submit" class="btn" id="convertBtn">开始转换</button>
+                </form>
+            </div>
+
+            <div class="card">
+                <div class="card-title">OEM 转换</div>
+                <form id="oemConvertForm">
+                    <div class="form-group">
+                        <label for="oem_logo_path">原图文件 (PNG/SVG)</label>
+                        <input type="file" id="oem_logo_path" name="logo_path" accept=".png,.svg,.jpg,.jpeg" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="document_path">MAC 文档图 (可选)</label>
+                        <input type="file" id="document_path" name="document_path" accept=".png,.jpg,.jpeg">
+                    </div>
+                    <button type="submit" class="btn" id="oemBtn">开始转换</button>
+                </form>
+            </div>
+
+            <div class="card">
+                <div class="card-title">添加圆角</div>
+                <form id="addRoundedCornersForm">
+                    <div class="form-group">
+                        <label for="corner_logo_path">原图文件 (PNG)</label>
+                        <input type="file" id="corner_logo_path" name="logo_path" accept=".png,.jpg,.jpeg" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="radius">圆角大小</label>
+                        <input type="text" id="radius" name="radius" 
+                               placeholder="例如: 10 或 10,20,30,40" required>
+                    </div>
+                    <button type="submit" class="btn" id="cornerBtn">添加圆角</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div id="message" class="toast"></div>
+
+    <script>
+        const API_BASE = window.location.origin;
+
+        // 工具函数
+        async function getBase64(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.readAsDataURL(file);
+                reader.onload = () => resolve(reader.result.split(',')[1]);
+                reader.onerror = error => reject(error);
+            });
+        }
+
+        function showMessage(message, isSuccess) {
+            const messageDiv = document.getElementById('message');
+            messageDiv.textContent = message;
+            messageDiv.className = `toast ${isSuccess ? 'success' : 'error'}`;
+            messageDiv.style.display = 'block';
+            
+            setTimeout(() => {
+                messageDiv.style.display = 'none';
+            }, 5000);
+        }
+
+        function setLoading(buttonId, isLoading) {
+            const btn = document.getElementById(buttonId);
+            if (isLoading) {
+                btn.disabled = true;
+                btn.innerHTML = '<span class="loading"></span>处理中...';
+            } else {
+                btn.disabled = false;
+                btn.innerHTML = btn.getAttribute('data-original-text') || btn.textContent;
+            }
+        }
+
+        async function handleFormSubmit(formId, endpoint, payloadBuilder, buttonId) {
+            const form = document.getElementById(formId);
+            const btn = document.getElementById(buttonId);
+            btn.setAttribute('data-original-text', btn.textContent);
+            
+            form.addEventListener('submit', async function(event) {
+                event.preventDefault();
+                setLoading(buttonId, true);
+                
+                try {
+                    const formData = new FormData(event.target);
+                    const payload = await payloadBuilder(formData);
+                    
+                    const response = await fetch(`${API_BASE}${endpoint}`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(payload)
+                    });
+
+                    const responseData = await response.text();
+                    if (response.ok) {
+                        showMessage(responseData || '操作成功', true);
+                    } else {
+                        showMessage(responseData || '操作失败', false);
+                    }
+                } catch (error) {
+                    showMessage(`错误: ${error.message}`, false);
+                } finally {
+                    setLoading(buttonId, false);
+                }
+            });
+        }
+
+        // 格式转换
+        handleFormSubmit('convertImageForm', '/convert_image', async (formData) => {
+            const file = formData.get('logo_path');
+            const output_path = formData.get('output_path');
+            const format = output_path.split('.').pop();
+
+            if (!format || format === output_path) {
+                throw new Error('保存名称需要有后缀名');
+            }
+
+            return {
+                logo_name: file.name,
+                logo_data: await getBase64(file),
+                output_path: output_path,
+                format: format.toUpperCase()
+            };
+        }, 'convertBtn');
+
+        // OEM 转换
+        handleFormSubmit('oemConvertForm', '/oem_convert', async (formData) => {
+            const file = formData.get('logo_path');
+            const document_file = formData.get('document_path');
+            
+            const payload = {
+                logo_name: file.name,
+                logo_data: await getBase64(file),
+                document_name: "",
+                document_data: ""
+            };
+
+            if (document_file && document_file.size > 0) {
+                payload.document_name = document_file.name;
+                payload.document_data = await getBase64(document_file);
+            }
+
+            return payload;
+        }, 'oemBtn');
+
+        // 添加圆角
+        handleFormSubmit('addRoundedCornersForm', '/add_rounded_corners', async (formData) => {
+            const file = formData.get('logo_path');
+            return {
+                logo_name: file.name,
+                logo_data: await getBase64(file),
+                radius: formData.get('radius')
+            };
+        }, 'cornerBtn');
+    </script>
+</body>
+</html>
