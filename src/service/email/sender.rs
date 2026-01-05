@@ -47,7 +47,6 @@ impl EmailSender {
         let data = serde_json::json!({
             "task_id": task_id,
             "branch": request.branch,
-            "oem_name": request.oem_name,
             "platform": request.platform,
             "server": request.server,
             "pkg_flag": request.pkg_flag,

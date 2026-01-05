@@ -103,15 +103,9 @@ pub async fn build_package(
         }
     } else {
         // 多架构任务：创建父任务
-        let oem = request.oem_name
-            .split('=')
-            .nth(1)
-            .unwrap_or_default()
-            .to_string();
-        
         let parent_task = crate::model::task::CreateTask {
             branch: request.branch.clone(),
-            oem_name: oem.clone(),
+            oem_name: String::new(),  // 已删除 OEM 配置
             commit_id: request.commit_id.clone().unwrap_or_default(),
             pkg_flag: format!("{} [{}]", request.pkg_flag, request.architectures.join(", ")),
             is_increment: request.is_increment,

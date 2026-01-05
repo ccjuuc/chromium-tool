@@ -154,3 +154,73 @@ pub async fn get_commit_id(src_path: &Path) -> Result<String> {
     Ok(commit_id)
 }
 
+/// 获取所有分支列表
+pub async fn get_branch_list(src_path: &Path) -> Result<Vec<String>> {
+    tracing::info!("📋 执行命令: git branch -a");
+    tracing::info!("📁 工作目录: {}", src_path.display());
+    
+    let output = Command::new("git")
+        .args(&["branch", "-a"])
+        .current_dir(src_path)
+        .output()
+        .context("Failed to get branch list")?;
+    
+    let exit_code = output.status.code().unwrap_or(-1);
+    
+    if !output.status.success() {
+        if !output.stderr.is_empty() {
+            tracing::error!("❌ 标准错误:\n{}", String::from_utf8_lossy(&output.stderr));
+        }
+        return Err(anyhow::anyhow!(
+            "Failed to get branch list, exit code: {}",
+            exit_code
+        ));
+    }
+    
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let branches: Vec<String> = output_str
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            // 跳过远程分支（remotes/）和 HEAD 指针
+            if line.starts_with("remotes/") || line.contains("HEAD") {
+                return None;
+            }
+            // 移除 * 标记（当前分支）
+            let branch = line.trim_start_matches("*").trim();
+            if branch.is_empty() {
+                None
+            } else {
+                Some(branch.to_string())
+            }
+        })
+        .collect();
+    
+    tracing::info!("✅ 找到 {} 个分支\n", branches.len());
+    
+    Ok(branches)
+}
+
+/// 获取主分支列表（main, master, develop 等）
+#[allow(dead_code)]
+pub async fn get_main_branches(src_path: &Path) -> Result<Vec<String>> {
+    let all_branches = get_branch_list(src_path).await?;
+    
+    // 优先顺序：main > master > develop
+    let priority_branches = vec!["main", "master", "develop"];
+    
+    let mut main_branches = Vec::new();
+    for priority in &priority_branches {
+        if all_branches.contains(&priority.to_string()) {
+            main_branches.push(priority.to_string());
+        }
+    }
+    
+    // 如果没有找到任何主分支，返回所有分支
+    if main_branches.is_empty() {
+        Ok(all_branches)
+    } else {
+        Ok(main_branches)
+    }
+}
+

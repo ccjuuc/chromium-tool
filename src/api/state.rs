@@ -116,9 +116,9 @@ impl AppState {
                     if let Some(arch) = &next_task.architecture {
                         let request = crate::model::build::BuildRequest {
                             branch: next_task.branch_name.clone(),
-                            oem_name: format!("current_xn_brand={}", next_task.oem_name),
                             commit_id: if next_task.commit_id.is_empty() { None } else { Some(next_task.commit_id) },
                             pkg_flag: next_task.pkg_flag.clone(),
+                            installer_format: None,
                             is_increment: next_task.is_increment,
                             is_signed: next_task.is_signed,
                             server: next_task.server.clone(),
@@ -127,7 +127,7 @@ impl AppState {
                             is_x64: arch == "x64" || arch == "x86",
                             custom_args: None,
                             is_update: false,
-                            email: None,
+                            emails: None,
                         };
                         
                         // 在调用前克隆所有需要的值，确保 Send

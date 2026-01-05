@@ -128,14 +128,7 @@ impl ProjectBuilder {
             args.push("target_cpu=\\\"x64\\\"".to_string());
         }
         
-        // 添加 OEM 参数
-        if !request.oem_name.is_empty() {
-            let oem = request.oem_name.split('=').nth(1).unwrap_or("normal");
-            if oem != "snow" {
-                let prefix = request.oem_name.split('=').nth(0).unwrap_or("current_xn_brand");
-                args.push(format!("{}=\\\"{}\\\"", prefix, oem));
-            }
-        }
+        // OEM 配置已删除，不再添加 OEM 参数
         
         // 添加自定义参数
         if let Some(custom_args) = &request.custom_args {

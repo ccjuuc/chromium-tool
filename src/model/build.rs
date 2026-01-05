@@ -26,12 +26,11 @@ pub struct BuildRequest {
     #[validate(length(min = 1, max = 100))]
     pub server: String,
     
-    #[validate(length(max = 50))]
-    pub oem_name: String,
-    
     pub custom_args: Option<Vec<String>>,
     
-    #[validate(email)]
-    pub email: Option<String>,
+    pub emails: Option<Vec<String>>,  // 邮箱列表，支持多个
+    
+    #[serde(default)]
+    pub installer_format: Option<String>,  // 安装包格式：dmg 或 pkg（仅 macOS）
 }
 

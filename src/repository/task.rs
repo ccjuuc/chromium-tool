@@ -376,6 +376,46 @@ impl TaskRepository {
         
         Ok(result.rows_affected())
     }
+    
+    /// 获取父任务的所有子任务
+    pub async fn get_child_tasks(&self, parent_id: i64) -> AppResult<Vec<Task>> {
+        let rows = sqlx::query("SELECT * FROM pkg WHERE parent_id = ? ORDER BY id ASC")
+            .bind(parent_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(AppError::Database)?;
+        
+        let tasks: Vec<Task> = rows.iter()
+            .map(|row| self.row_to_task(row))
+            .collect();
+        
+        Ok(tasks)
+    }
+    
+    /// 检查所有子任务是否都完成了 build chrome（状态为 success 或 build chrome 之后的状态）
+    pub async fn all_children_completed_chrome(&self, parent_id: i64) -> AppResult<bool> {
+        let children = self.get_child_tasks(parent_id).await?;
+        
+        if children.is_empty() {
+            return Ok(false);
+        }
+        
+        // 检查所有子任务是否都完成了 build chrome
+        // 完成 build chrome 意味着状态是 success 或者状态是 build chrome 之后的任何状态
+        let all_completed = children.iter().all(|child| {
+            matches!(
+                child.state,
+                TaskState::BuildingChrome | 
+                TaskState::Combining | 
+                TaskState::BuildingInstaller | 
+                TaskState::Signing | 
+                TaskState::BackingUp | 
+                TaskState::Success
+            ) || child.state == TaskState::BuildingChrome
+        });
+        
+        Ok(all_completed)
+    }
 }
 
 // 为 TaskState 实现 FromStr
@@ -392,6 +432,7 @@ impl std::str::FromStr for TaskState {
             "build pre_build" => Ok(TaskState::BuildingPreBuild),
             "build base" => Ok(TaskState::BuildingBase),
             "build chrome" => Ok(TaskState::BuildingChrome),
+            "combining" => Ok(TaskState::Combining),
             "build installer" => Ok(TaskState::BuildingInstaller),
             "sign" => Ok(TaskState::Signing),
             "backup" => Ok(TaskState::BackingUp),

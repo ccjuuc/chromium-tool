@@ -153,6 +153,91 @@
             user-select: none;
         }
 
+        .email-tags-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .email-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 4px 8px;
+            background: #667eea;
+            color: white;
+            border-radius: 16px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            white-space: nowrap;
+        }
+
+        .email-tag .delete-x {
+            cursor: pointer;
+            width: 16px;
+            height: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.3);
+            transition: background 0.2s ease;
+            font-size: 14px;
+            line-height: 1;
+            margin-left: 2px;
+        }
+
+        .email-tag .delete-x:hover {
+            background: rgba(255, 255, 255, 0.5);
+        }
+
+        .email-dropdown {
+            position: absolute;
+            top: calc(100% + 8px);
+            left: 0;
+            right: 0;
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            max-height: 200px;
+            overflow-y: auto;
+            z-index: 1000;
+        }
+
+        .email-dropdown-item {
+            padding: 10px 16px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: background 0.2s ease;
+        }
+
+        .email-dropdown-item:hover {
+            background: #f5f5f5;
+        }
+
+        .email-dropdown-item.selected {
+            background: #e8f0fe;
+        }
+
+        .email-dropdown-item .check-icon {
+            width: 16px;
+            height: 16px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: #667eea;
+            font-weight: bold;
+            visibility: hidden;
+        }
+
+        .email-dropdown-item.selected .check-icon {
+            visibility: visible;
+        }
+
         .checkbox-item.disabled {
             opacity: 0.5;
             text-decoration: line-through;
@@ -364,11 +449,13 @@
                     </div>
                     <div class="form-group">
                         <label for="email">邮箱 (可选)</label>
-                        <input type="email" id="email" name="email" placeholder="接收通知的邮箱">
-                    </div>
-                    <div class="form-group">
-                        <label id="oem_key" for="oem">OEM</label>
-                        <select id="oem" name="oem"></select>
+                        <div style="position: relative;">
+                            <input type="text" id="email_input" name="email" placeholder="输入邮箱并回车添加" autocomplete="off">
+                            <div class="email-tags-container" id="email_tags_container" style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px;"></div>
+                            <div class="email-dropdown" id="email_dropdown" style="display: none;">
+                                <!-- 下拉选项将通过 JavaScript 动态添加 -->
+                            </div>
+                        </div>
                     </div>
                     <div class="form-group">
                         <label for="server">服务器</label>
@@ -389,6 +476,14 @@
                 <div class="form-group">
                     <label>构建参数</label>
                     <div id="build_args_container" class="checkbox-group"></div>
+                </div>
+
+                <div class="form-group" id="installer_format_group" style="display: none;">
+                    <label for="installer_format">安装包格式（仅 macOS）</label>
+                    <select id="installer_format" name="installer_format">
+                        <option value="dmg" selected>DMG</option>
+                        <option value="pkg">PKG</option>
+                    </select>
                 </div>
 
                 <button type="submit" class="btn" id="buildBtn">开始构建</button>
@@ -767,6 +862,14 @@
             if (!serverValue) return;
             
             const [platform] = serverValue.split('-');
+            
+            // 显示/隐藏安装包格式选项（仅 macOS）
+            const installerFormatGroup = document.getElementById('installer_format_group');
+            if (platform === 'macos' || platform === 'mac') {
+                installerFormatGroup.style.display = 'block';
+            } else {
+                installerFormatGroup.style.display = 'none';
+            }
             const container = document.getElementById('arch_container');
             container.innerHTML = '';
             
@@ -809,29 +912,242 @@
             });
         }
 
-        // 获取 OEM 列表
-        async function fetchOemList() {
+        // 邮箱列表管理
+        let emailOptions = []; // 所有可选的邮箱（从配置或历史记录中获取）
+        let selectedEmails = []; // 已选中的邮箱
+
+        async function initEmailSelect() {
+            const emailInput = document.getElementById('email_input');
+            const emailDropdown = document.getElementById('email_dropdown');
+            const emailContainer = emailInput ? emailInput.closest('.form-group') : null;
+            
+            // 初始化邮箱选项（可以从配置或历史记录中加载）
+            await loadEmailOptions();
+            
+            // 监听输入框输入
+            if (emailInput) {
+                emailInput.addEventListener('input', function(e) {
+                    const value = e.target.value.trim();
+                    if (value) {
+                        filterAndShowDropdown(value);
+                    } else {
+                        hideDropdown();
+                    }
+                });
+                
+                // 监听回车键，添加邮箱
+                emailInput.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const email = emailInput.value.trim();
+                        if (email) {
+                            addEmail(email);
+                            emailInput.value = '';
+                            hideDropdown();
+                        }
+                    } else if (e.key === 'Escape') {
+                        hideDropdown();
+                    }
+                });
+                
+                // 监听焦点事件
+                emailInput.addEventListener('focus', function() {
+                    if (emailInput.value.trim()) {
+                        filterAndShowDropdown(emailInput.value.trim());
+                    } else {
+                        showAllDropdown();
+                    }
+                });
+            }
+            
+            // 点击外部关闭下拉菜单
+            document.addEventListener('click', function(e) {
+                if (emailContainer && !emailContainer.contains(e.target)) {
+                    hideDropdown();
+                }
+            });
+        }
+
+        async function loadEmailOptions() {
+            // 从配置文件中加载邮箱列表
             try {
-                const response = await fetch(`${API_BASE}/oem_list`);
-                const data = await response.json();
-                const oemSelect = document.getElementById('oem');
-                const oemKeyLabel = document.getElementById('oem_key');
+                // 这里可以从后端API获取配置中的邮箱列表
+                // 暂时使用硬编码的常用邮箱
+                emailOptions = [
+                    'ccjuuc@163.com',
+                    'test@163.com'
+                ];
+            } catch (error) {
+                console.error('加载邮箱选项失败:', error);
+                emailOptions = [];
+            }
+        }
 
-                oemKeyLabel.onclick = () => {
-                    oemKeyLabel.classList.toggle('disabled');
-                };
-
-                if (data.oem_key && data.oems) {
-                    oemKeyLabel.textContent = `${data.oem_key}:`;
-                    data.oems.forEach(item => {
-                        const option = document.createElement('option');
-                        option.value = item;
-                        option.textContent = item || '(空)';
-                        oemSelect.appendChild(option);
+        function filterAndShowDropdown(searchText) {
+            const emailDropdown = document.getElementById('email_dropdown');
+            emailDropdown.innerHTML = '';
+            
+            // 过滤邮箱选项
+            const filtered = emailOptions.filter(email => 
+                email.toLowerCase().includes(searchText.toLowerCase()) && 
+                !selectedEmails.includes(email)
+            );
+            
+            // 如果输入的是新邮箱，也显示在列表中
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (emailRegex.test(searchText) && !selectedEmails.includes(searchText) && !emailOptions.includes(searchText)) {
+                filtered.unshift(searchText);
+            }
+            
+            if (filtered.length > 0) {
+                filtered.forEach(email => {
+                    const item = document.createElement('div');
+                    item.className = 'email-dropdown-item';
+                    item.innerHTML = `
+                        <span class="check-icon">✓</span>
+                        <span>${email}</span>
+                    `;
+                    item.addEventListener('click', () => {
+                        addEmail(email);
+                        document.getElementById('email_input').value = '';
+                        hideDropdown();
                     });
+                    emailDropdown.appendChild(item);
+                });
+                emailDropdown.style.display = 'block';
+            } else {
+                hideDropdown();
+            }
+        }
+
+        function showAllDropdown() {
+            const emailDropdown = document.getElementById('email_dropdown');
+            emailDropdown.innerHTML = '';
+            
+            const available = emailOptions.filter(email => !selectedEmails.includes(email));
+            
+            if (available.length > 0) {
+                available.forEach(email => {
+                    const item = document.createElement('div');
+                    item.className = 'email-dropdown-item';
+                    item.innerHTML = `
+                        <span class="check-icon">✓</span>
+                        <span>${email}</span>
+                    `;
+                    item.addEventListener('click', () => {
+                        addEmail(email);
+                        document.getElementById('email_input').value = '';
+                        hideDropdown();
+                    });
+                    emailDropdown.appendChild(item);
+                });
+                emailDropdown.style.display = 'block';
+            } else {
+                hideDropdown();
+            }
+        }
+
+        function hideDropdown() {
+            const emailDropdown = document.getElementById('email_dropdown');
+            emailDropdown.style.display = 'none';
+        }
+
+        function addEmail(email) {
+            // 验证邮箱格式
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(email)) {
+                showMessage('请输入有效的邮箱地址', false);
+                return false;
+            }
+            
+            // 检查是否已存在
+            if (selectedEmails.includes(email)) {
+                showMessage('该邮箱已添加', false);
+                return false;
+            }
+            
+            // 添加到选中列表
+            selectedEmails.push(email);
+            
+            // 如果不在选项中，添加到选项列表
+            if (!emailOptions.includes(email)) {
+                emailOptions.push(email);
+            }
+            
+            // 渲染标签
+            renderEmailTags();
+            return true;
+        }
+
+        function removeEmail(email) {
+            selectedEmails = selectedEmails.filter(e => e !== email);
+            renderEmailTags();
+        }
+
+        function renderEmailTags() {
+            const container = document.getElementById('email_tags_container');
+            container.innerHTML = '';
+            
+            selectedEmails.forEach(email => {
+                const tag = document.createElement('div');
+                tag.className = 'email-tag';
+                tag.innerHTML = `
+                    <span>${email}</span>
+                    <span class="delete-x">×</span>
+                `;
+                
+                // 绑定删除事件
+                const deleteX = tag.querySelector('.delete-x');
+                deleteX.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    removeEmail(email);
+                });
+                
+                container.appendChild(tag);
+            });
+        }
+
+        // 获取分支列表
+        async function fetchBranchList() {
+            try {
+                const response = await fetch(`${API_BASE}/branch_list`);
+                const data = await response.json();
+                const branchSelect = document.getElementById('branch');
+                
+                // 清空现有选项
+                branchSelect.innerHTML = '';
+                
+                if (data.branches && data.branches.length > 0) {
+                    data.branches.forEach(branch => {
+                        const option = document.createElement('option');
+                        option.value = branch;
+                        option.textContent = branch;
+                        branchSelect.appendChild(option);
+                    });
+                    
+                    // 设置默认分支
+                    if (data.default_branch) {
+                        branchSelect.value = data.default_branch;
+                    } else if (data.branches.length > 0) {
+                        branchSelect.value = data.branches[0];
+                    }
+                } else {
+                    // 如果没有获取到分支，使用默认值
+                    const defaultOption = document.createElement('option');
+                    defaultOption.value = 'main';
+                    defaultOption.textContent = 'main';
+                    branchSelect.appendChild(defaultOption);
                 }
             } catch (error) {
-                console.error('Error fetching OEM list:', error);
+                console.error('Error fetching branch list:', error);
+                // 出错时使用默认值
+                const branchSelect = document.getElementById('branch');
+                if (branchSelect.options.length === 0) {
+                    const defaultOption = document.createElement('option');
+                    defaultOption.value = 'main';
+                    defaultOption.textContent = 'main';
+                    branchSelect.appendChild(defaultOption);
+                }
             }
         }
 
@@ -907,11 +1223,6 @@
 
             try {
                 const formData = new FormData(event.target);
-                const oemKeyLabel = document.getElementById('oem_key');
-                const oemKey = oemKeyLabel.classList.contains('disabled') 
-                    ? '' 
-                    : oemKeyLabel.textContent.replace(':', '');
-                const oemName = formData.get('oem') || '';
                 const serverData = formData.get('server');
                 const [platform, server] = serverData.split('-');
 
@@ -951,7 +1262,6 @@
                 const payload = {
                     branch: formData.get('branch'),
                     commit_id: formData.get('commit_id') || null,
-                    oem_name: (oemKey && oemName) ? `${oemKey}=${oemName}` : '',
                     platform: platform,
                     is_increment: isIncrement,
                     is_update: isUpdate,
@@ -960,7 +1270,7 @@
                     is_signed: isSigned,
                     server: server,
                     pkg_flag: formData.get('pkg_flag') || '',
-                    email: formData.get('email') || null,
+                    emails: selectedEmails.length > 0 ? selectedEmails : null,
                     custom_args: customArgs.length > 0 ? customArgs : null
                 };
 
@@ -1085,9 +1395,10 @@
         document.addEventListener('DOMContentLoaded', () => {
             fetchTasks();
             fetchServerList();
-            fetchOemList();
+            fetchBranchList();
             fetchCustomList();
             fetchBuildArgsList();
+            initEmailSelect();
             setInterval(fetchTasks, 5000);  // 每5秒刷新一次任务列表
         });
     </script>

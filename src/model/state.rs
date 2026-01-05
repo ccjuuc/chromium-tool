@@ -26,6 +26,9 @@ pub enum TaskState {
     #[serde(rename = "build chrome")]
     BuildingChrome,
     
+    #[serde(rename = "combining")]
+    Combining,  // 正在组合多个架构
+    
     #[serde(rename = "build installer")]
     BuildingInstaller,
     
@@ -62,7 +65,9 @@ impl TaskState {
             (TaskState::GeneratingProject, TaskState::BuildingPreBuild) => true,
             (TaskState::BuildingPreBuild, TaskState::BuildingBase) => true,
             (TaskState::BuildingBase, TaskState::BuildingChrome) => true,
+            (TaskState::BuildingChrome, TaskState::Combining) => true,
             (TaskState::BuildingChrome, TaskState::BuildingInstaller) => true,
+            (TaskState::Combining, TaskState::BuildingInstaller) => true,
             (TaskState::BuildingInstaller, TaskState::Signing) => true,
             (TaskState::Signing, TaskState::BackingUp) => true,
             (TaskState::BackingUp, TaskState::Success) => true,
@@ -84,6 +89,7 @@ impl TaskState {
             TaskState::BuildingPreBuild => "build pre_build",
             TaskState::BuildingBase => "build base",
             TaskState::BuildingChrome => "build chrome",
+            TaskState::Combining => "combining",
             TaskState::BuildingInstaller => "build installer",
             TaskState::Signing => "sign",
             TaskState::BackingUp => "backup",
@@ -103,6 +109,7 @@ impl TaskState {
             "build pre_build" => Some(TaskState::BuildingPreBuild),
             "build base" => Some(TaskState::BuildingBase),
             "build chrome" => Some(TaskState::BuildingChrome),
+            "combining" => Some(TaskState::Combining),
             "build installer" => Some(TaskState::BuildingInstaller),
             "sign" => Some(TaskState::Signing),
             "backup" => Some(TaskState::BackingUp),

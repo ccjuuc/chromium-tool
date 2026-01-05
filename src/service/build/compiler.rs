@@ -136,44 +136,20 @@ impl Compiler {
                             let line = line.trim_end().to_string();
                             if !line.is_empty() {
                                 // 检测是否是进度行（格式：[数字/数字] 开头）
-                                // 例如：[390/51744] CXX obj/...
+                                // 例如：[390/51744] CXX obj/... 或 [1660/37976] COPY ...
+                                // 简化匹配：只要以 [数字/数字] 开头就认为是进度行
                                 let is_progress = {
                                     let trimmed = line.trim_start();
-                                    trimmed.starts_with('[') && {
-                                        // 使用简单的字符串匹配检查 [数字/数字] 模式
-                                        let mut chars = trimmed.chars().skip(1); // 跳过 '['
-                                        let mut has_digits_before = false;
-                                        let mut has_slash = false;
-                                        let mut has_digits_after = false;
-                                        let mut has_close = false;
-                                        
-                                        // 检查数字
-                                        while let Some(c) = chars.next() {
-                                            if c.is_ascii_digit() {
-                                                has_digits_before = true;
-                                            } else if c == '/' && has_digits_before {
-                                                has_slash = true;
-                                                break;
-                                            } else {
-                                                break;
-                                            }
-                                        }
-                                        
-                                        // 检查斜杠后的数字和右括号
-                                        if has_slash {
-                                            while let Some(c) = chars.next() {
-                                                if c.is_ascii_digit() {
-                                                    has_digits_after = true;
-                                                } else if c == ']' && has_digits_after {
-                                                    has_close = true;
-                                                    break;
-                                                } else {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        
-                                        has_digits_before && has_slash && has_digits_after && has_close
+                                    if trimmed.starts_with('[') {
+                                        // 使用正则表达式匹配 [数字/数字] 模式
+                                        use regex::Regex;
+                                        static PROGRESS_PATTERN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+                                        let pattern = PROGRESS_PATTERN.get_or_init(|| {
+                                            Regex::new(r"^\[\d+/\d+\]").unwrap()
+                                        });
+                                        pattern.is_match(trimmed)
+                                    } else {
+                                        false
                                     }
                                 };
                                 
