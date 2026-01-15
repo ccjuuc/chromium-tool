@@ -164,7 +164,7 @@ impl ProjectBuilder {
             format!("gn gen {} --args=\"{}\" {}", out_dir, gn_args_str, ide_args)
         };
         
-        tracing::info!("执行命令: {} (参数: {})", gn_command, gn_args_str);
+        tracing::info!("执行命令: {}", gn_command);
         
         let start_time = std::time::Instant::now();
         let output = Command::new(os::SHELL[0])

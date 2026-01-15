@@ -22,6 +22,8 @@ pub struct Task {
     pub architecture: Option<String>,  // 架构信息
     #[serde(default)]
     pub build_log: Option<String>,  // 构建日志
+    #[serde(default)]
+    pub installer_format: Option<String>,  // 安装包格式：dmg 或 pkg
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +37,7 @@ pub struct CreateTask {
     pub server: String,
     pub parent_id: Option<i64>,  // 父任务ID
     pub architecture: Option<String>,  // 架构信息
+    pub installer_format: Option<String>,  // 安装包格式：dmg 或 pkg
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +74,7 @@ impl Default for Task {
             parent_id: None,
             architecture: None,
             build_log: None,
+            installer_format: None,
         }
     }
 }

@@ -1259,6 +1259,13 @@
                 const isX64 = selectedArchs.some(arch => arch === 'x64' || arch === 'x86');
                 
                 // 一次性发送所有架构
+                // 获取安装包格式（仅 macOS）
+                const installerFormatSelect = document.getElementById('installer_format');
+                const installerFormatGroup = document.getElementById('installer_format_group');
+                const installerFormat = installerFormatGroup && installerFormatGroup.style.display !== 'none' 
+                    ? installerFormatSelect.value 
+                    : null;
+                
                 const payload = {
                     branch: formData.get('branch'),
                     commit_id: formData.get('commit_id') || null,
@@ -1271,7 +1278,8 @@
                     server: server,
                     pkg_flag: formData.get('pkg_flag') || '',
                     emails: selectedEmails.length > 0 ? selectedEmails : null,
-                    custom_args: customArgs.length > 0 ? customArgs : null
+                    custom_args: customArgs.length > 0 ? customArgs : null,
+                    installer_format: installerFormat
                 };
 
                 try {

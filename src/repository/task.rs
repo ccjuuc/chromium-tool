@@ -4,14 +4,14 @@ use crate::model::task::{Task, CreateTask};
 use crate::model::state::TaskState;
 
 const TASKLIST_QUERY: &str = r#"
-  SELECT id, start_time, branch_name, end_time, oem_name, commit_id, pkg_flag, is_signed, is_increment, storage_path, installer, state, server, parent_id, architecture, build_log
+  SELECT id, start_time, branch_name, end_time, oem_name, commit_id, pkg_flag, is_signed, is_increment, storage_path, installer, state, server, parent_id, architecture, build_log, installer_format
   FROM pkg
   ORDER BY COALESCE(parent_id, id) DESC, id ASC
 "#;
 
 const ADD_TASK: &str = r#"
-INSERT INTO pkg (start_time, branch_name, oem_name, commit_id, pkg_flag, is_increment, is_signed, server, parent_id, architecture)
-VALUES (datetime('now', 'localtime'), ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO pkg (start_time, branch_name, oem_name, commit_id, pkg_flag, is_increment, is_signed, server, parent_id, architecture, installer_format)
+VALUES (datetime('now', 'localtime'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 RETURNING id
 "#;
 
@@ -55,6 +55,7 @@ impl TaskRepository {
             .bind(&task.server)
             .bind(task.parent_id)
             .bind(&task.architecture)
+            .bind(&task.installer_format)
             .fetch_one(&self.pool)
             .await
             .map_err(AppError::Database)?;
@@ -317,6 +318,7 @@ impl TaskRepository {
             },
             architecture: row.try_get("architecture").ok(),
             build_log: row.try_get("build_log").ok(),
+            installer_format: row.try_get("installer_format").ok().flatten(),
         }
     }
     

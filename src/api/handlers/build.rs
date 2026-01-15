@@ -113,6 +113,7 @@ pub async fn build_package(
             server: request.server.clone(),
             parent_id: None,
             architecture: None,
+            installer_format: request.installer_format.clone(),
         };
         
         match task_repo.create(&parent_task).await {

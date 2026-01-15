@@ -68,6 +68,7 @@ impl BuildService {
             server: request.server.clone(),
             parent_id: None,
             architecture,
+            installer_format: request.installer_format.clone(),
         };
         
         let task_id = task_repo.create(&create_task).await?;
@@ -217,6 +218,7 @@ impl BuildService {
             server: request.server.clone(),
             parent_id: Some(parent_id),  // 设置父任务ID
             architecture,  // 设置架构信息
+            installer_format: request.installer_format.clone(),
         };
         
         let task_id = task_repo.create(&create_task).await?;
@@ -364,6 +366,19 @@ async fn do_build(
     tracing::info!("📦 分支: {}", request.branch);
     tracing::info!("🖥️  平台: {}", request.platform);
     tracing::info!("📁 源码路径: {}", src_path.display());
+    tracing::info!("📋 ====== 前端传递的完整配置 ======");
+    tracing::info!("   commit_id: {:?}", request.commit_id);
+    tracing::info!("   pkg_flag: {}", request.pkg_flag);
+    tracing::info!("   is_update: {}", request.is_update);
+    tracing::info!("   is_x64: {}", request.is_x64);
+    tracing::info!("   architectures: {:?}", request.architectures);
+    tracing::info!("   is_increment: {}", request.is_increment);
+    tracing::info!("   is_signed: {}", request.is_signed);
+    tracing::info!("   server: {}", request.server);
+    tracing::info!("   custom_args: {:?}", request.custom_args);
+    tracing::info!("   emails: {:?}", request.emails);
+    tracing::info!("   installer_format: {:?}", request.installer_format);
+    tracing::info!("📋 ================================");
     tracing::info!("═══════════════════════════════════════════════════════\n");
     
     // 生成输出目录名称

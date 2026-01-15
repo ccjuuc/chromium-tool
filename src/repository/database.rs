@@ -64,6 +64,7 @@ pub async fn init_db(config: &AppConfig) -> Result<Option<SqlitePool>> {
     let _ = pool.execute("ALTER TABLE pkg ADD COLUMN parent_id INTEGER").await;
     let _ = pool.execute("ALTER TABLE pkg ADD COLUMN architecture TEXT").await;
     let _ = pool.execute("ALTER TABLE pkg ADD COLUMN build_log TEXT").await;
+    let _ = pool.execute("ALTER TABLE pkg ADD COLUMN installer_format TEXT").await;
     
     Ok(Some(pool))
 }

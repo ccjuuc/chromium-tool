@@ -118,7 +118,7 @@ impl AppState {
                             branch: next_task.branch_name.clone(),
                             commit_id: if next_task.commit_id.is_empty() { None } else { Some(next_task.commit_id) },
                             pkg_flag: next_task.pkg_flag.clone(),
-                            installer_format: None,
+                            installer_format: next_task.installer_format.clone(),
                             is_increment: next_task.is_increment,
                             is_signed: next_task.is_signed,
                             server: next_task.server.clone(),
