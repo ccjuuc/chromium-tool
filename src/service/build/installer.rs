@@ -2,40 +2,8 @@ use std::path::Path;
 use std::process::Command;
 use anyhow::{Context, Result};
 use crate::config::AppConfig;
-use serde::{Serialize, Deserialize};
+use appdmg_rs::{DmgConfig, DmgContent, DmgWindow, DmgWindowSize};
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DmgContent {
-    pub x: u32,
-    pub y: u32,
-    #[serde(rename = "type")]
-    pub type_: String,
-    pub path: String,
-    #[serde(skip)]
-    pub name: Option<String>, // Optional override for filename in DMG
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DmgWindowSize {
-    pub width: u32,
-    pub height: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DmgWindow {
-    pub size: DmgWindowSize,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct DmgConfig {
-    pub title: String,
-    pub icon: String,
-    pub background: String,
-    #[serde(rename = "icon-size")]
-    pub icon_size: f64,
-    pub window: DmgWindow,
-    pub contents: Vec<DmgContent>,
-}
 
 #[cfg(target_os = "windows")]
 mod os {
@@ -224,161 +192,12 @@ impl InstallerBuilder {
     }
 
 
-    /// 使用纯 Rust 实现生成包含完整布局的 DMG (Data-Driven)
-    #[cfg(target_os = "macos")]
-    async fn create_dmg_rust_native(&self, config: &DmgConfig, final_dmg_path: &Path) -> Result<()> {
-        use std::process::Command;
-        use tokio::fs;
-        use crate::service::build::ds_store::{Entry, write_ds_store};
-        use crate::service::build::macos_alias::AliasInfo;
 
-        tracing::info!("📦 使用纯 Rust 原生方式创建 DMG (Config驱动)...");
-
-        // 1. 准备构建目录
-        let temp_dir = std::env::temp_dir().join(format!("joyme_dmg_native_{}", std::process::id()));
-        if temp_dir.exists() { fs::remove_dir_all(&temp_dir).await?; }
-        fs::create_dir_all(&temp_dir).await?;
-
-        // 2. 根据 contents 准备文件
-        for item in &config.contents {
-            let src_path = Path::new(&item.path);
-            let item_name = item.name.as_deref().or_else(|| src_path.file_name().and_then(|n| n.to_str())).unwrap_or("file");
-            let dest_path = temp_dir.join(item_name);
-
-            if item.type_ == "file" {
-                // Copy file/dir recursively
-                let status = Command::new("cp").arg("-R").arg(src_path).arg(&dest_path).status()?;
-                if !status.success() { return Err(anyhow::anyhow!("复制文件失败: {:?}", src_path)); }
-            } else if item.type_ == "link" {
-                // Create symlink
-                let _ = tokio::fs::symlink(src_path, &dest_path).await;
-            }
-        }
-
-        // 3. 处理背景图 (如果 config.background 指向的文件不在 tmp 里，需要复制过去吗？)
-        // appdmg 逻辑是：background 路径是本地的，它会生成 .background 并复制进去
-        let bg_dir = temp_dir.join(".background");
-        fs::create_dir_all(&bg_dir).await?;
-        
-        let bg_src = Path::new(&config.background);
-        if bg_src.exists() {
-             let _ = fs::copy(bg_src, bg_dir.join("background.png")).await;
-        } else {
-             // 如果背景图是临时生成的，可能外部已经传入了路径。这里假设 exists。
-             tracing::warn!("Warning: Background file not found at {}", config.background);
-        }
-
-        // 4. 创建可读写 DMG (UDRW)
-        let temp_dmg_path = temp_dir.parent().unwrap().join(format!("temp_rw_{}.dmg", std::process::id()));
-        if temp_dmg_path.exists() { fs::remove_file(&temp_dmg_path).await?; }
-        
-        // HFS+ is strictly required for custom icons/bg on older/compatible DMGs
-        let status = Command::new("hdiutil")
-            .arg("create")
-            .arg("-srcfolder").arg(&temp_dir)
-            .arg("-volname").arg(&config.title)
-            .arg("-fs").arg("HFS+") 
-            .arg("-format").arg("UDRW")
-            .arg("-ov")
-            .arg(&temp_dmg_path)
-            .status()?;
-            
-        if !status.success() { return Err(anyhow::anyhow!("创建临时 DMG 失败")); }
-        
-        // 5. 挂载 DMG
-        tracing::info!("   挂载临时 DMG...");
-        let attach_output = Command::new("hdiutil")
-            .arg("attach")
-            .arg("-readwrite")
-            .arg("-noverify")
-            .arg("-noautoopen")
-            .arg(&temp_dmg_path)
-            .output()?;
-        
-        let output_str = String::from_utf8_lossy(&attach_output.stdout);
-        let mount_point = output_str.lines()
-            .find_map(|line| line.split('\t').last().map(|s| s.trim()).filter(|s| s.starts_with("/Volumes/")))
-            .ok_or_else(|| anyhow::anyhow!("无法获取挂载点"))?;
-        let mount_path = Path::new(mount_point);
-        
-        // 6. 在挂载点进行布局配置
-        
-        // Hide .background & .fseventsd
-        let _ = Command::new("chflags").arg("hidden").arg(mount_path.join(".background")).status();
-        let _ = Command::new("chflags").arg("hidden").arg(mount_path.join(".fseventsd")).status();
-
-        // Generate Alias for Background (Always .background/background.png inside volume)
-        let vol_bg_path = mount_path.join(".background/background.png");
-        let alias_info = AliasInfo::new(&vol_bg_path).ok();
-        let bg_alias_data = alias_info.and_then(|i| i.encode().ok());
-        
-        // Generate DS_Store Entries
-        let mut entries = Vec::new();
-        
-        // Position items based on Config
-        for item in &config.contents {
-             let item_name = item.name.as_deref().or_else(|| Path::new(&item.path).file_name().and_then(|n| n.to_str())).unwrap_or("file");
-             
-             // Skip Iloc for "license" to let Finder auto-arrange it (align with hidden files)
-             if item_name == "license" { continue; }
-             
-             entries.push(Entry::new_iloc(item_name, item.x, item.y));
-        }
-        
-        // Note: Do NOT add Iloc for hidden files (.background, .fseventsd).
-        // Setting their position to (1000, 1000) causes Finder to extend the scrollable area,
-        // resulting in unwanted scrollbars. Since they are hidden, we don't need to position them.
-        
-        // Window & Options
-        if let Ok(e) = Entry::new_bwsp(config.window.size.width, config.window.size.height) { entries.push(e); }
-        if let Ok(e) = Entry::new_icvp(config.icon_size, bg_alias_data) { entries.push(e); }
-        
-        // Write DS_Store
-        write_ds_store(&mount_path.join(".DS_Store"), entries).await?;
-        
-        // 6.5 设置 Volume Icon (窗口标题栏图标 & 挂载图标)
-        if Path::new(&config.icon).exists() {
-             let dest_icon = mount_path.join(".VolumeIcon.icns");
-             if let Ok(_) = fs::copy(&config.icon, &dest_icon).await {
-                 // 隐藏 .VolumeIcon.icns
-                 let _ = Command::new("chflags").arg("hidden").arg(&dest_icon).status();
-                 
-                 // 激活 Volume 的自定义图标属性 (SetFile -a C /Volumes/Name)
-                 // 注意: SetFile 需要 Xcode Command Line Tools
-                 let _ = Command::new("SetFile").arg("-a").arg("C").arg(mount_path).status();
-             } else {
-                 tracing::warn!("⚠️  复制 Volume Icon 失败");
-             }
-        }
-        
-        // Ensure changes are flushed
-        let _ = Command::new("sync").status();
-
-        // 7. Detach & Convert
-        let _ = Command::new("hdiutil").arg("detach").arg(mount_point).arg("-force").status();
-        
-        if final_dmg_path.exists() { fs::remove_file(final_dmg_path).await?; } // Warning: caller usually handles this
-        
-        let status = Command::new("hdiutil")
-            .arg("convert")
-            .arg(&temp_dmg_path)
-            .arg("-format").arg("UDZO")
-            .arg("-o").arg(final_dmg_path)
-            .status()?;
-            
-        let _ = fs::remove_dir_all(&temp_dir).await;
-        let _ = fs::remove_file(&temp_dmg_path).await;
-        
-        if !status.success() { return Err(anyhow::anyhow!("DMG 转换失败")); }
-        
-        tracing::info!("✅ DMG 创建成功 (Rust Native): {}", final_dmg_path.display());
-        Ok(())
-    }
 
     /// 创建 macOS DMG 安装包
     #[cfg(target_os = "macos")]
     async fn create_dmg(&self, src_path: &Path, out_dir: &str) -> Result<()> {
-        use std::process::Command;
+
         use tokio::fs;
         
         tracing::info!("📦 开始创建 DMG 安装包...");
@@ -428,26 +247,38 @@ impl InstallerBuilder {
             }
         ];
         
-        // 4.3 添加 License 文件夹 (New Requirement)
-        // 尝试从资源中查找 license.txt，如果没有则创建一个默认的
-        let license_dir = temp_dir.join("license");
-        fs::create_dir_all(&license_dir).await?;
+        // 4. 尝试从 src 目录读取 LICENSE 文件
+        let src_dir = Path::new(&self.config.src.macos);
+        let license_candidates = vec!["LICENSE.txt", "license.txt","LICENSE"];
+        let mut license_file: Option<std::path::PathBuf> = None;
         
-        let src_license = app_path.join("Contents/Resources/license.txt");
-        let dest_license = license_dir.join("license.txt");
-        
-        if src_license.exists() {
-             fs::copy(&src_license, &dest_license).await?;
-        } else {
-             fs::write(&dest_license, "{\n  \"license\": \"Copyright (c) 2026 JoyME. All Rights Reserved.\"\n}").await?;
+        for license_name in &license_candidates {
+            let license_path = src_dir.join(license_name);
+            if license_path.exists() {
+                license_file = Some(license_path);
+                break;
+            }
         }
         
-        contents.push(DmgContent {
-            x: 330, y: 310,
-            type_: "file".to_string(),
-            path: license_dir.to_string_lossy().to_string(),
-            name: Some("license".to_string()),
-        });
+        if let Some(src_license) = license_file {
+            // LICENSE 文件存在，将其复制到临时目录并添加到 DMG
+            let license_dir = temp_dir.join("license");
+            fs::create_dir_all(&license_dir).await?;
+            let dest_license = license_dir.join(src_license.file_name().unwrap_or_default());
+            fs::copy(&src_license, &dest_license).await?;
+            
+            tracing::info!("   ✅ 找到 LICENSE 文件: {}", src_license.display());
+            
+            contents.push(DmgContent {
+                x: 330, y: 310,
+                type_: "file".to_string(),
+                path: license_dir.to_string_lossy().to_string(),
+                name: Some("license".to_string()),
+            });
+        } else {
+            // LICENSE 文件不存在，只输出 warn
+            tracing::warn!("   ⚠️  在 src 目录 ({}) 中未找到 LICENSE 文件，跳过添加到 DMG", src_dir.display());
+        }
 
         let config = DmgConfig {
             title: volume_name,
@@ -458,13 +289,16 @@ impl InstallerBuilder {
             contents,
         };
         
-        // 4. 调用 Rust Native 实现
-        let result = self.create_dmg_rust_native(&config, &final_dmg_path).await;
+        // 4. 调用 appdmg-rs
+        // 注意：appdmg-rs 内部可能会输出 "chflags: .fseventsd: No such file or directory" 的警告
+        // 这是无害的：.fseventsd 是 macOS 的 Spotlight 索引目录，在 DMG 挂载时可能被自动创建，
+        // 但库尝试设置其属性时目录可能已不存在，这是正常情况，不影响 DMG 创建
+        appdmg_rs::build(&config, &final_dmg_path).await?;
         
         // 清理临时文件
         let _ = fs::remove_dir_all(&temp_dir).await;
         
-        result
+        Ok(())
     }
     
     #[cfg(not(target_os = "macos"))]

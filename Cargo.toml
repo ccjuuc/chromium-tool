@@ -149,10 +149,14 @@ windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
 byteorder = "1.5.0"
 plist = "1.8.0"
 serde_bytes = "0.11.19"
+appdmg-rs = { git = "https://github.com/ccjuuc/appdmg-rs.git" }
 
-[dev-dependencies]
+
+[dev-dependencies ]
 tokio-test = "0.4"
 mockall = "0.12"
 criterion = "0.5"
 
 # 注意：profile 应该在 workspace 根目录的 Cargo.toml 中配置
+
+
