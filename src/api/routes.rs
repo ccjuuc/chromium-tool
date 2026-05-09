@@ -20,6 +20,11 @@ pub fn create_router(state: AppState) -> Router {
         // OEM 路由
         .route("/oem", get(handlers::oem::oem_page))
         .route("/convert_image", post(handlers::oem::convert_image))
+        .route("/convert_output/:file_name", get(handlers::oem::get_convert_output))
+        .route(
+            "/convert_output_svg/:file_name",
+            get(handlers::oem::get_convert_output_svg),
+        )
         .route("/oem_convert", post(handlers::oem::oem_convert))
         .route("/add_rounded_corners", post(handlers::oem::add_rounded_corners))
         

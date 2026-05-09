@@ -1,10 +1,13 @@
 use axum::{
+    extract::Path,
     extract::Json,
+    http::header::CONTENT_TYPE,
     http::StatusCode,
     response::{Html, IntoResponse},
 };
 use std::env::{current_dir, var_os};
 use std::path::PathBuf;
+use serde::Serialize;
 use base64::engine::general_purpose::STANDARD;
 use base64::engine::Engine;
 use crate::model::oem::{ConvertRequest, OemRequest, CornerRequest};
@@ -33,6 +36,152 @@ fn convert_work_dir() -> Result<PathBuf, std::io::Error> {
     Ok(current_dir()?.join("convert_output"))
 }
 
+/// 仅允许单层文件名，禁止路径穿越。
+fn sanitize_convert_output_basename(raw: &str) -> Result<String, &'static str> {
+    let name = std::path::Path::new(raw)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("invalid output path")?;
+    let mut it = std::path::Path::new(name).components();
+    match (it.next(), it.next()) {
+        (Some(std::path::Component::Normal(_)), None) => {}
+        _ => return Err("invalid output filename"),
+    }
+    if name.is_empty() || name.len() > 512 {
+        return Err("invalid output filename");
+    }
+    Ok(name.to_string())
+}
+
+/// 把上传文件名转成 `<stem>-ori<ext>`，与转换输出名隔离，避免互相覆盖。
+///
+/// - `foo.svg`        → `foo-ori.svg`
+/// - `foo`            → `foo-ori`
+/// - `archive.tar.gz` → `archive.tar-ori.gz`（按最后一个 `.` 切）
+/// - 已经带 `-ori` 后缀的不会再加一遍。
+fn original_storage_name(raw: &str) -> String {
+    let p = std::path::Path::new(raw);
+    let file_name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(raw);
+    match file_name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => {
+            if stem.ends_with("-ori") {
+                file_name.to_string()
+            } else {
+                format!("{}-ori.{}", stem, ext)
+            }
+        }
+        _ => {
+            if file_name.ends_with("-ori") {
+                file_name.to_string()
+            } else {
+                format!("{}-ori", file_name)
+            }
+        }
+    }
+}
+
+fn convert_output_content_type(file_name: &str) -> &'static str {
+    match std::path::Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("icns") => "application/octet-stream",
+        Some("icon") => "text/plain; charset=utf-8",
+        Some("svg") => "image/svg+xml; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// 供前端预览：从 `convert_work_dir` 读取刚转换的文件（仅单层 basename）。
+pub async fn get_convert_output(Path(file_name): Path<String>) -> impl IntoResponse {
+    let safe = match sanitize_convert_output_basename(&file_name) {
+        Ok(s) => s,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    let work_dir = match convert_work_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("convert dir: {}", e),
+            )
+                .into_response();
+        }
+    };
+    let path = work_dir.join(&safe);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let ct = convert_output_content_type(&safe);
+            (
+                StatusCode::OK,
+                [(CONTENT_TYPE, ct)],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            format!("file not found: {} ({})", safe, e),
+        )
+            .into_response(),
+    }
+}
+
+/// 将 `.icon` 转为 SVG，供浏览器 `<img>` 预览（原始 `/convert_output/*.icon` 为纯文本，不能直接作为图片）。
+pub async fn get_convert_output_svg(Path(file_name): Path<String>) -> impl IntoResponse {
+    let safe = match sanitize_convert_output_basename(&file_name) {
+        Ok(s) => s,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    if !safe.to_ascii_lowercase().ends_with(".icon") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "SVG preview is only available for .icon files",
+        )
+            .into_response();
+    }
+    let work_dir = match convert_work_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("convert dir: {}", e),
+            )
+                .into_response();
+        }
+    };
+    let path = work_dir.join(&safe);
+    let path_str = match path.to_str() {
+        Some(s) => s,
+        None => return (StatusCode::BAD_REQUEST, "Invalid path").into_response(),
+    };
+    match chromium_icon::try_convert_chromium_icon_path_to_svg_markup(path_str) {
+        Ok(svg) => (
+            StatusCode::OK,
+            [(
+                CONTENT_TYPE,
+                "image/svg+xml; charset=utf-8",
+            )],
+            svg.into_bytes(),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct ConvertImageOk {
+    message: String,
+    preview_name: String,
+}
+
 pub async fn convert_image(Json(payload): Json<ConvertRequest>) -> impl IntoResponse {
     let work_dir = match convert_work_dir() {
         Ok(p) => p,
@@ -53,29 +202,34 @@ pub async fn convert_image(Json(payload): Json<ConvertRequest>) -> impl IntoResp
             .into_response();
     }
 
-    let logo_path_buf = work_dir.join(&payload.logo_name);
-    
+    // 上传的原图统一以 `<stem>-ori<ext>` 落盘，与转换输出区分，避免互相覆盖、便于回溯。
+    let original_name = original_storage_name(&payload.logo_name);
+    let logo_path_buf = work_dir.join(&original_name);
+
     let logo_path = match logo_path_buf.to_str() {
         Some(path) => path,
         None => return (StatusCode::BAD_REQUEST, "Invalid logo path").into_response(),
     };
-    
+
     let logo_data = match STANDARD.decode(&payload.logo_data) {
         Ok(data) => data,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid base64 data: {}", e)).into_response(),
     };
-    
+
     if let Err(e) = std::fs::write(logo_path, &logo_data) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e)).into_response();
     }
-    
-    let output_path = &payload.output_path;
+
+    let safe_output_name = match sanitize_convert_output_basename(&payload.output_path) {
+        Ok(s) => s,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
     let format = &payload.format;
 
     tracing::info!(
-        "convert_image: logo='{}', output='{}', format='{}', size={}",
-        payload.logo_name,
-        output_path,
+        "convert_image: original='{}', output='{}', format='{}', size={}",
+        original_name,
+        safe_output_name,
         format,
         logo_data.len()
     );
@@ -83,7 +237,7 @@ pub async fn convert_image(Json(payload): Json<ConvertRequest>) -> impl IntoResp
     // 把可能 panic 的转换函数放到 catch_unwind 里，确保即便底层 svg 解析
     // 等地方 panic，也能把可读的错误回给前端而不是返回空 500。
     let logo_path_owned = logo_path.to_string();
-    let output_path_owned = output_path.clone();
+    let output_path_owned = safe_output_name.clone();
     let format_owned = format.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         match format_owned.as_str() {
@@ -107,6 +261,25 @@ pub async fn convert_image(Json(payload): Json<ConvertRequest>) -> impl IntoResp
                     Err("svg file is required for PNG conversion".to_string())
                 }
             }
+            "SVG" => {
+                let lower = logo_path_owned.to_ascii_lowercase();
+                if !lower.ends_with(".icon") {
+                    return Err(".icon source file is required for SVG conversion".to_string());
+                }
+                let svg = chromium_icon::try_convert_chromium_icon_path_to_svg_markup(&logo_path_owned)?;
+                let parent = std::path::Path::new(&logo_path_owned)
+                    .parent()
+                    .ok_or_else(|| "invalid logo path".to_string())?;
+                let out_full = parent.join(&output_path_owned);
+                std::fs::write(&out_full, svg.as_bytes()).map_err(|e| {
+                    format!(
+                        "Failed to write SVG to {}: {}",
+                        out_full.display(),
+                        e
+                    )
+                })?;
+                Ok(out_full.to_string_lossy().into_owned())
+            }
             other => Err(format!("Unsupported format: {}", other)),
         }
     }));
@@ -114,7 +287,14 @@ pub async fn convert_image(Json(payload): Json<ConvertRequest>) -> impl IntoResp
     match result {
         Ok(Ok(ret)) => {
             tracing::info!("convert_image ok: {}", ret);
-            (StatusCode::OK, ret).into_response()
+            (
+                StatusCode::OK,
+                Json(ConvertImageOk {
+                    message: ret,
+                    preview_name: safe_output_name,
+                }),
+            )
+                .into_response()
         }
         Ok(Err(msg)) => {
             tracing::error!("convert_image error: {}", msg);
@@ -251,3 +431,38 @@ pub async fn add_rounded_corners(Json(payload): Json<CornerRequest>) -> impl Int
     (StatusCode::OK, outpath).into_response()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::original_storage_name;
+
+    #[test]
+    fn appends_ori_before_extension() {
+        assert_eq!(original_storage_name("envelope.svg"), "envelope-ori.svg");
+        assert_eq!(original_storage_name("foo.bar.png"), "foo.bar-ori.png");
+        assert_eq!(original_storage_name("a.b.c.icon"), "a.b.c-ori.icon");
+    }
+
+    #[test]
+    fn appends_ori_when_no_extension() {
+        assert_eq!(original_storage_name("Makefile"), "Makefile-ori");
+    }
+
+    #[test]
+    fn handles_dotfiles_without_stem() {
+        // 没有 stem 时（".env"），不能切成 "-ori.env"，按"无扩展名"处理。
+        assert_eq!(original_storage_name(".env"), ".env-ori");
+    }
+
+    #[test]
+    fn idempotent_when_already_ori() {
+        assert_eq!(original_storage_name("envelope-ori.svg"), "envelope-ori.svg");
+        assert_eq!(original_storage_name("Makefile-ori"), "Makefile-ori");
+    }
+
+    #[test]
+    fn strips_directory_components() {
+        // 防御：即使前端塞了相对路径，也只取文件名部分。
+        assert_eq!(original_storage_name("sub/dir/foo.svg"), "foo-ori.svg");
+        assert_eq!(original_storage_name("..\\bar.png"), "bar-ori.png");
+    }
+}

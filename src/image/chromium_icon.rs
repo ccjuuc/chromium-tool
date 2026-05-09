@@ -1,9 +1,9 @@
 use std::fs::File;
-use std::io::{self, BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use svg::node::element::path::{Command, Data, Position};
 use svg::node::element::tag::Type;
-use svg::node::element::Path as SvgPath;
+use svg::node::element::{Circle, Ellipse, Path as SvgPath, Rectangle};
 use svg::node::Value;
 use svg::parser::Event;
 use svg::Document;
@@ -143,6 +143,161 @@ fn color_to_argb(color: &str) -> String {
 
 fn expand_nibble(c: &str) -> String {
     format!("{0}{0}", c)
+}
+
+/// 把 `style="fill: #abc; stroke-width: 1"` 这类 CSS 声明字符串解析为 map。
+/// key 统一小写，value 保留原始大小写以便颜色 hex 不变。
+fn parse_inline_style_decls(style: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for decl in style.split(';') {
+        let decl = decl.trim();
+        if decl.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = decl.split_once(':') {
+            out.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+    out
+}
+
+fn strip_css_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 一个迷你 CSS 解析器，仅识别形如 `selector1, selector2 { prop: value; ... }` 的规则。
+///
+/// 不支持 `@media`、`:hover` 等高级语法（也基本不会在静态 SVG 资源里出现）。
+/// 对每个选择器返回其声明集合；同选择器多次出现时按出现顺序合并（后者覆盖前者）。
+fn parse_svg_css(text: &str) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    let cleaned = strip_css_comments(text);
+    let mut sheet: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    let mut cursor = cleaned.as_str();
+    loop {
+        let lb = match cursor.find('{') {
+            Some(p) => p,
+            None => break,
+        };
+        let selector_part = cursor[..lb].trim();
+        let after_lb = &cursor[lb + 1..];
+        let rb = match after_lb.find('}') {
+            Some(p) => p,
+            None => break,
+        };
+        let body = &after_lb[..rb];
+        let decls = parse_inline_style_decls(body);
+        if !selector_part.is_empty() && !decls.is_empty() {
+            for sel in selector_part.split(',') {
+                let sel = sel.trim();
+                if sel.is_empty() {
+                    continue;
+                }
+                let entry = sheet.entry(sel.to_string()).or_default();
+                for (k, v) in &decls {
+                    entry.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        cursor = &after_lb[rb + 1..];
+    }
+    sheet
+}
+
+/// 扫描事件流，把所有 `<style>...</style>` 中的 CSS 文本拼接后解析为 stylesheet。
+///
+/// 之所以需要这个：很多在线 SVG（svgrepo 等）会用 CSS 类来设置 `fill`，
+/// 而我们正向转换 (`handle_svg_*`) 只看 inline `fill=` 属性，导致颜色全部丢失，
+/// 反向预览时所有路径退化成同一个 fallback 颜色，整张图看起来变成"白板"。
+fn collect_svg_stylesheet(
+    events: &[Event<'_>],
+) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    let mut depth: usize = 0;
+    let mut buf = String::new();
+    let mut sheet: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    for ev in events {
+        match ev {
+            Event::Tag("style", t, _) => match t {
+                Type::Start => depth += 1,
+                Type::End => {
+                    if depth > 0 {
+                        depth -= 1;
+                        if depth == 0 {
+                            for (sel, decls) in parse_svg_css(&buf) {
+                                let entry = sheet.entry(sel).or_default();
+                                for (k, v) in decls {
+                                    entry.insert(k, v);
+                                }
+                            }
+                            buf.clear();
+                        }
+                    }
+                }
+                Type::Empty => {}
+            },
+            Event::Text(text) if depth > 0 => {
+                buf.push_str(text);
+            }
+            _ => {}
+        }
+    }
+    sheet
+}
+
+/// 按 SVG/CSS 优先级解析出元素最终生效的 `fill` / `fill-rule`：
+///
+/// 优先级（高 → 低）：inline `style="fill:..."` > CSS class > CSS tag selector > 表现属性 `fill="..."`
+///
+/// 返回新的 attributes（`fill` / `fill-rule` 已被覆盖），其它键原样保留。
+fn resolve_svg_styles(
+    stylesheet: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    attributes: &std::collections::HashMap<String, Value>,
+    tag: &str,
+) -> std::collections::HashMap<String, Value> {
+    let mut effective: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    if let Some(decls) = stylesheet.get(tag) {
+        for (k, v) in decls {
+            effective.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(class_attr) = attributes.get("class") {
+        for class in class_attr.to_string().split_whitespace() {
+            let key = format!(".{}", class);
+            if let Some(decls) = stylesheet.get(&key) {
+                for (k, v) in decls {
+                    effective.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    if let Some(style_attr) = attributes.get("style") {
+        for (k, v) in parse_inline_style_decls(&style_attr.to_string()) {
+            effective.insert(k, v);
+        }
+    }
+
+    let mut out = attributes.clone();
+    for key in ["fill", "fill-rule"] {
+        if let Some(v) = effective.get(key) {
+            out.insert(key.to_string(), Value::from(v.as_str()));
+        }
+    }
+    out
 }
 
 /// 解析一个浮点数，宽容地接受 `12px` / `12pt` 这类带单位的写法（仅取数字部分）。
@@ -759,7 +914,12 @@ pub fn try_convert_svg_to_chromium_icon(
         canvas_dimensions = 24.0; // 与 Material Design 默认尺寸保持一致
     }
 
-    writeln!(output_file, "CANVAS_DIMENSIONS, {},", format_number(canvas_dimensions as f32))
+    // CANVAS_DIMENSIONS 在 Chromium 端按整数解析（见 ui/gfx/vector_icon_utils.cc 中
+    // `ParsePathElement` 对 `kCanvasDimensions` 的 `atoi`），小数会直接被截断或导致
+    // 解析失败。这里统一四舍五入，避免 `viewBox="… 464.955 464.955"` 这类非整数
+    // 画布尺寸生成出 `CANVAS_DIMENSIONS, 464.95,` 而无法被 Chromium 加载。
+    let canvas_int = (canvas_dimensions.round() as i64).max(1);
+    writeln!(output_file, "CANVAS_DIMENSIONS, {},", canvas_int)
         .map_err(|e| format!("Failed to write canvas dimensions: {}", e))?;
 
     // 第 2 轮：依次生成 path/rect/circle/ellipse 命令。
@@ -776,6 +936,10 @@ pub fn try_convert_svg_to_chromium_icon(
     // 所以这里要明确忽略 End。
     let is_open_tag = |t: &Type| matches!(t, Type::Start | Type::Empty);
 
+    // 先扫一遍 `<style>` 拿到 CSS 规则，否则像 svgrepo 那种用 class 染色的 SVG
+    // 在生成 .icon 时会全部丢失颜色。
+    let stylesheet = collect_svg_stylesheet(&events);
+
     let mut emitted_path = false;
     for event in events.iter() {
         match event {
@@ -788,7 +952,8 @@ pub fn try_convert_svg_to_chromium_icon(
                 }
             }
             Event::Tag("path", t, attributes) if is_open_tag(t) => {
-                let data = handle_svg_path(attributes, emitted_path);
+                let resolved = resolve_svg_styles(&stylesheet, attributes, "path");
+                let data = handle_svg_path(&resolved, emitted_path);
                 if !data.is_empty() {
                     write!(output_file, "{}", data)
                         .map_err(|e| format!("Failed to write path: {}", e))?;
@@ -796,7 +961,8 @@ pub fn try_convert_svg_to_chromium_icon(
                 }
             }
             Event::Tag("circle", t, attributes) if is_open_tag(t) => {
-                let data = handle_svg_circle(t, attributes, emitted_path);
+                let resolved = resolve_svg_styles(&stylesheet, attributes, "circle");
+                let data = handle_svg_circle(t, &resolved, emitted_path);
                 if !data.is_empty() {
                     write!(output_file, "{}", data)
                         .map_err(|e| format!("Failed to write circle: {}", e))?;
@@ -804,7 +970,8 @@ pub fn try_convert_svg_to_chromium_icon(
                 }
             }
             Event::Tag("rect", t, attributes) if is_open_tag(t) => {
-                let data = handle_svg_rect(t, attributes, emitted_path);
+                let resolved = resolve_svg_styles(&stylesheet, attributes, "rect");
+                let data = handle_svg_rect(t, &resolved, emitted_path);
                 if !data.is_empty() {
                     write!(output_file, "{}", data)
                         .map_err(|e| format!("Failed to write rect: {}", e))?;
@@ -812,7 +979,8 @@ pub fn try_convert_svg_to_chromium_icon(
                 }
             }
             Event::Tag("ellipse", t, attributes) if is_open_tag(t) => {
-                let data = handle_svg_ellipse(t, attributes, emitted_path);
+                let resolved = resolve_svg_styles(&stylesheet, attributes, "ellipse");
+                let data = handle_svg_ellipse(t, &resolved, emitted_path);
                 if !data.is_empty() {
                     write!(output_file, "{}", data)
                         .map_err(|e| format!("Failed to write ellipse: {}", e))?;
@@ -826,28 +994,103 @@ pub fn try_convert_svg_to_chromium_icon(
     Ok(dst.to_string_lossy().into_owned())
 }
 
-/// 把 Chromium `.icon` 文件反向解析为一个 SVG 文件（用于预览）。
-///
-/// 与正向转换相比，反向转换覆盖更完整的 Chromium 命令集合，并把
-/// 默认填充规则设为 `evenodd`（与 Chromium 默认一致）。
-#[allow(dead_code)]
-pub fn convert_chromium_icon_to_svg(icon_path: &str, output_path: &str) {
-    let file = File::open(icon_path).expect("Failed to open input file");
-    let reader = io::BufReader::new(file);
+/// 反向转换时的一层 SVG 子节点（路径或 Chromium 基本形）。
+enum ReverseIconLayer {
+    Path {
+        fill_rule: String,
+        fill: Option<String>,
+        data: Data,
+    },
+    Circle {
+        cx: f32,
+        cy: f32,
+        r: f32,
+        fill: Option<String>,
+    },
+    Ellipse {
+        cx: f32,
+        cy: f32,
+        rx: f32,
+        ry: f32,
+        fill: Option<String>,
+    },
+    RoundRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        fill: Option<String>,
+    },
+}
 
-    let mut data = Data::new();
+/// Chromium 未写 `PATH_COLOR_ARGB` 的路径在运行时由 `CreateVectorIcon(..., color)` 上色；
+/// 导出为静态 SVG 时没有该颜色，若用 SVG 默认黑色会与设计稿（常见为白底/反白）不符。
+/// 这里用白色作为模板区默认填充；`evenodd` 镂空则依赖下方同色的全画布衬底显出「白心」。
+const REVERSE_ICON_TEMPLATE_FILL: &str = "#ffffff";
+
+/// 规范化 `.icon` 行首命令名：去 BOM、首尾空白，并只保留 `A–Z` / `0–9` / `_` 前缀。
+///
+/// 部分工具或剪贴板会在 `NEW_PATH` 等词后附带不可见 Unicode（如 U+200E），会导致
+/// 与字面 `"NEW_PATH"` 匹配失败；这里与 Chromium 实际使用的 ASCII 命令名对齐。
+fn strip_icon_command_token(raw: &str) -> String {
+    let s = raw.trim().trim_start_matches('\u{feff}');
+    s.chars()
+        .take_while(|c| matches!(*c, 'A'..='Z' | '0'..='9' | '_'))
+        .collect()
+}
+
+/// 解析 `.icon` 行内浮点坐标。仅允许 **单个** 尾部 `f`/`F`（旧式 `1.5f`），不得对整段做 `trim_end_matches('f')`，
+/// 否则会破坏 `PATH_COLOR_ARGB` 里的 `0xff` 等十六进制字面量。
+fn parse_icon_f32_token(s: &str) -> f32 {
+    let s = s.trim();
+    if let Ok(v) = s.parse::<f32>() {
+        return v;
+    }
+    if s.len() > 1 {
+        let b = s.as_bytes();
+        let last = b[b.len() - 1];
+        if last == b'f' || last == b'F' {
+            if let Ok(v) = s[..s.len() - 1].parse::<f32>() {
+                return v;
+            }
+        }
+    }
+    0.0
+}
+
+fn flush_icon_path_layer(
+    data: Data,
+    path_nonempty: bool,
+    fill_rule: &str,
+    fill: &Option<String>,
+    out: &mut Vec<ReverseIconLayer>,
+) {
+    if !path_nonempty {
+        return;
+    }
+    out.push(ReverseIconLayer::Path {
+        fill_rule: fill_rule.to_string(),
+        fill: fill.clone(),
+        data,
+    });
+}
+
+/// 把 Chromium `.icon` 源文本反向解析为 SVG 字符串（供 `<img src>` 等预览）。
+///
+/// 支持 `NEW_PATH` 多子路径、`CIRCLE` / `OVAL` / `ROUND_RECT` 与路径命令混合，
+/// 与正向 `handle_svg_*` 输出对齐，避免信封等形状在预览中丢失。
+pub fn try_convert_chromium_icon_source_to_svg_markup(source: &str) -> Result<String, String> {
+    let mut layers: Vec<ReverseIconLayer> = Vec::new();
+    let mut path_data = Data::new();
+    let mut path_nonempty = false;
     let mut canvas_dimensions: u32 = 24;
-    // Chromium 默认 evenodd；遇到 FILL_RULE_NONZERO 才切换为 nonzero。
     let mut fill_rule = "evenodd".to_string();
     let mut fill_color: Option<String> = None;
-
-    // 跟踪画笔位置，便于 H/V 等需要补另一坐标的反向转换。
     let mut pen = PenState::default();
 
-    for line in reader.lines() {
-        let line = line.expect("Failed to read line");
+    for line in source.lines() {
         let trimmed = line.trim();
-        // 去掉行尾注释与空行
         let stripped = match trimmed.find("//") {
             Some(i) => trimmed[..i].trim(),
             None => trimmed,
@@ -858,22 +1101,23 @@ pub fn convert_chromium_icon_to_svg(icon_path: &str, output_path: &str) {
 
         let parts: Vec<String> = stripped
             .split(',')
-            .map(|s| s.trim().trim_end_matches('f').to_string())
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
         if parts.is_empty() {
             continue;
         }
 
-        let cmd = parts[0].as_str();
-        // 通用的浮点数取数辅助
+        let cmd = strip_icon_command_token(&parts[0]);
+        if cmd.is_empty() {
+            continue;
+        }
         let pf = |i: usize| -> f32 {
             parts
                 .get(i)
-                .and_then(|s| s.parse::<f32>().ok())
+                .map(|s| parse_icon_f32_token(s))
                 .unwrap_or(0.0)
         };
-        // 解析 0x.. 或十进制
         let pi = |i: usize| -> i64 {
             parts
                 .get(i)
@@ -887,9 +1131,13 @@ pub fn convert_chromium_icon_to_svg(icon_path: &str, output_path: &str) {
                 .unwrap_or(0)
         };
 
-        match cmd {
+        match cmd.as_str() {
             "CANVAS_DIMENSIONS" => {
-                canvas_dimensions = pf(1) as u32;
+                // 与正向输出对齐：Chromium 这里期望整数，遇到历史遗留的小数也四舍五入。
+                let raw = pf(1);
+                if raw > 0.0 {
+                    canvas_dimensions = raw.round().max(1.0) as u32;
+                }
             }
             "FILL_RULE_NONZERO" => {
                 fill_rule = "nonzero".to_string();
@@ -905,80 +1153,144 @@ pub fn convert_chromium_icon_to_svg(icon_path: &str, output_path: &str) {
                     fill_color = Some(format!("#{:02X}{:02X}{:02X}{:02X}", r, g, b, a));
                 }
             }
+            "NEW_PATH" => {
+                let old = std::mem::replace(&mut path_data, Data::new());
+                let had = path_nonempty;
+                path_nonempty = false;
+                flush_icon_path_layer(old, had, &fill_rule, &fill_color, &mut layers);
+                pen = PenState::default();
+            }
+            "CIRCLE" => {
+                let old = std::mem::replace(&mut path_data, Data::new());
+                let had = path_nonempty;
+                path_nonempty = false;
+                flush_icon_path_layer(old, had, &fill_rule, &fill_color, &mut layers);
+                pen = PenState::default();
+                layers.push(ReverseIconLayer::Circle {
+                    cx: pf(1),
+                    cy: pf(2),
+                    r: pf(3),
+                    fill: fill_color.clone(),
+                });
+            }
+            "OVAL" => {
+                let old = std::mem::replace(&mut path_data, Data::new());
+                let had = path_nonempty;
+                path_nonempty = false;
+                flush_icon_path_layer(old, had, &fill_rule, &fill_color, &mut layers);
+                pen = PenState::default();
+                layers.push(ReverseIconLayer::Ellipse {
+                    cx: pf(1),
+                    cy: pf(2),
+                    rx: pf(3),
+                    ry: pf(4),
+                    fill: fill_color.clone(),
+                });
+            }
+            "ROUND_RECT" => {
+                let old = std::mem::replace(&mut path_data, Data::new());
+                let had = path_nonempty;
+                path_nonempty = false;
+                flush_icon_path_layer(old, had, &fill_rule, &fill_color, &mut layers);
+                pen = PenState::default();
+                layers.push(ReverseIconLayer::RoundRect {
+                    x: pf(1),
+                    y: pf(2),
+                    w: pf(3),
+                    h: pf(4),
+                    r: pf(5),
+                    fill: fill_color.clone(),
+                });
+            }
             "MOVE_TO" => {
                 let (x, y) = (pf(1), pf(2));
-                data = data.move_to((x, y));
+                path_data = path_data.move_to((x, y));
                 pen.move_abs(x, y);
+                path_nonempty = true;
             }
             "R_MOVE_TO" => {
                 let (x, y) = (pf(1), pf(2));
-                data = data.move_by((x, y));
+                path_data = path_data.move_by((x, y));
                 pen.move_rel(x, y);
+                path_nonempty = true;
             }
             "LINE_TO" => {
                 let (x, y) = (pf(1), pf(2));
-                data = data.line_to((x, y));
+                path_data = path_data.line_to((x, y));
                 pen.line_abs(x, y);
+                path_nonempty = true;
             }
             "R_LINE_TO" => {
                 let (x, y) = (pf(1), pf(2));
-                data = data.line_by((x, y));
+                path_data = path_data.line_by((x, y));
                 pen.line_rel(x, y);
+                path_nonempty = true;
             }
             "H_LINE_TO" => {
                 let x = pf(1);
-                data = data.horizontal_line_to(x);
+                path_data = path_data.horizontal_line_to(x);
                 pen.line_abs(x, pen.cur_y);
+                path_nonempty = true;
             }
             "R_H_LINE_TO" => {
                 let x = pf(1);
-                data = data.horizontal_line_by(x);
+                path_data = path_data.horizontal_line_by(x);
                 pen.line_rel(x, 0.0);
+                path_nonempty = true;
             }
             "V_LINE_TO" => {
                 let y = pf(1);
-                data = data.vertical_line_to(y);
+                path_data = path_data.vertical_line_to(y);
                 pen.line_abs(pen.cur_x, y);
+                path_nonempty = true;
             }
             "R_V_LINE_TO" => {
                 let y = pf(1);
-                data = data.vertical_line_by(y);
+                path_data = path_data.vertical_line_by(y);
                 pen.line_rel(0.0, y);
+                path_nonempty = true;
             }
             "QUADRATIC_TO" => {
                 let (x1, y1, x, y) = (pf(1), pf(2), pf(3), pf(4));
-                data = data.quadratic_curve_to((x1, y1, x, y));
+                path_data = path_data.quadratic_curve_to((x1, y1, x, y));
                 pen.line_abs(x, y);
+                path_nonempty = true;
             }
             "R_QUADRATIC_TO" => {
                 let (x1, y1, x, y) = (pf(1), pf(2), pf(3), pf(4));
-                data = data.quadratic_curve_by((x1, y1, x, y));
+                path_data = path_data.quadratic_curve_by((x1, y1, x, y));
                 pen.line_rel(x, y);
+                path_nonempty = true;
             }
             "QUADRATIC_TO_SHORTHAND" => {
                 let (x, y) = (pf(1), pf(2));
-                data = data.smooth_quadratic_curve_to((x, y));
+                path_data = path_data.smooth_quadratic_curve_to((x, y));
                 pen.line_abs(x, y);
+                path_nonempty = true;
             }
             "R_QUADRATIC_TO_SHORTHAND" => {
                 let (x, y) = (pf(1), pf(2));
-                data = data.smooth_quadratic_curve_by((x, y));
+                path_data = path_data.smooth_quadratic_curve_by((x, y));
                 pen.line_rel(x, y);
+                path_nonempty = true;
             }
             "CUBIC_TO" => {
                 let (x1, y1, x2, y2, x, y) = (pf(1), pf(2), pf(3), pf(4), pf(5), pf(6));
-                data = data.cubic_curve_to((x1, y1, x2, y2, x, y));
+                path_data = path_data.cubic_curve_to((x1, y1, x2, y2, x, y));
                 pen.line_abs(x, y);
+                path_nonempty = true;
             }
             "R_CUBIC_TO" => {
                 let (x1, y1, x2, y2, x, y) = (pf(1), pf(2), pf(3), pf(4), pf(5), pf(6));
-                data = data.cubic_curve_by((x1, y1, x2, y2, x, y));
+                path_data = path_data.cubic_curve_by((x1, y1, x2, y2, x, y));
                 pen.line_rel(x, y);
+                path_nonempty = true;
             }
             "CUBIC_TO_SHORTHAND" => {
                 let (x2, y2, x, y) = (pf(1), pf(2), pf(3), pf(4));
-                data = data.smooth_cubic_curve_to((x2, y2, x, y));
+                path_data = path_data.smooth_cubic_curve_to((x2, y2, x, y));
                 pen.line_abs(x, y);
+                path_nonempty = true;
             }
             "ARC_TO" => {
                 let rx = pf(1);
@@ -988,8 +1300,9 @@ pub fn convert_chromium_icon_to_svg(icon_path: &str, output_path: &str) {
                 let sweep = if pi(5) != 0 { 1.0 } else { 0.0 };
                 let x = pf(6);
                 let y = pf(7);
-                data = data.elliptical_arc_to((rx, ry, rot, large, sweep, x, y));
+                path_data = path_data.elliptical_arc_to((rx, ry, rot, large, sweep, x, y));
                 pen.line_abs(x, y);
+                path_nonempty = true;
             }
             "R_ARC_TO" => {
                 let rx = pf(1);
@@ -999,42 +1312,155 @@ pub fn convert_chromium_icon_to_svg(icon_path: &str, output_path: &str) {
                 let sweep = if pi(5) != 0 { 1.0 } else { 0.0 };
                 let x = pf(6);
                 let y = pf(7);
-                data = data.elliptical_arc_by((rx, ry, rot, large, sweep, x, y));
+                path_data = path_data.elliptical_arc_by((rx, ry, rot, large, sweep, x, y));
                 pen.line_rel(x, y);
+                path_nonempty = true;
             }
             "CLOSE" => {
-                data = data.close();
+                path_data = path_data.close();
                 pen.close();
+                path_nonempty = true;
             }
-            "CIRCLE" | "OVAL" | "ROUND_RECT" | "NEW_PATH" | "PATH_COLOR_ALPHA"
-            | "PATH_MODE_CLEAR" | "STROKE" | "CAP_SQUARE" | "CLIP" | "DISABLE_AA"
-            | "FLIPS_IN_RTL" => {
-                // 这些命令不直接映射成 svg `d` 数据；为保持简单，反向预览时忽略。
-                // 真正需要的话可以在外部追加 <circle>/<rect> 等节点。
-                eprintln!("[chromium_icon] reverse: command '{}' is ignored", cmd);
+            "PATH_COLOR_ALPHA" | "PATH_MODE_CLEAR" | "STROKE" | "CAP_SQUARE" | "CLIP"
+            | "DISABLE_AA" | "FLIPS_IN_RTL" => {
+                tracing::debug!(
+                    target: "chromium_icon",
+                    command = %cmd,
+                    "reverse: skip optional vector command"
+                );
             }
             _ => {
-                eprintln!("[chromium_icon] reverse: unknown command '{}'", cmd);
+                tracing::warn!(
+                    target: "chromium_icon",
+                    command = %cmd,
+                    "reverse: unknown vector command"
+                );
             }
         }
     }
 
-    let mut path = SvgPath::new()
-        .set("fill-rule", fill_rule.as_str())
-        .set("d", data);
-    if let Some(c) = fill_color {
-        path = path.set("fill", c);
-    } else {
-        path = path.set("fill", "black");
-    }
+    flush_icon_path_layer(
+        path_data,
+        path_nonempty,
+        &fill_rule,
+        &fill_color,
+        &mut layers,
+    );
 
-    let document = Document::new()
+    // `.icon` 只存 `CANVAS_DIMENSIONS`（设计坐标 / viewBox），不存渲染尺寸；
+    // Chromium 在运行时由 `CreateVectorIcon(.., size, ..)` 决定 px。
+    //
+    // 仍然写出 width/height = canvas_dimensions：浏览器把外部 SVG 装入 `<img>` 时
+    // 不解析 viewBox，缺失 width/height 会被认为「无内在尺寸」从而被 CSS `width:auto`
+    // 算成 0×0，导致灯箱里大图不可见。这里给一个最自然的内在尺寸（= 设计坐标），
+    // 由调用方/容器再按需缩放即可。
+    let mut doc = Document::new()
+        .set("xmlns", "http://www.w3.org/2000/svg")
         .set("viewBox", (0u32, 0u32, canvas_dimensions, canvas_dimensions))
         .set("width", canvas_dimensions)
         .set("height", canvas_dimensions)
-        .add(path);
+        .set("preserveAspectRatio", "xMidYMid meet")
+        .set("fill-rule", "evenodd");
+    // 底层衬底：使 evenodd 子路径形成的「洞」透出白色，而不是透明（在深色背景/`<img>` 下呈黑）。
+    doc = doc.add(
+        Rectangle::new()
+            .set("x", 0)
+            .set("y", 0)
+            .set("width", canvas_dimensions)
+            .set("height", canvas_dimensions)
+            .set("fill", REVERSE_ICON_TEMPLATE_FILL),
+    );
 
-    svg::save(output_path, &document).expect("Failed to save SVG file");
+    for layer in layers {
+        doc = match layer {
+            ReverseIconLayer::Path {
+                fill_rule,
+                fill,
+                data,
+            } => {
+                let mut p = SvgPath::new()
+                    .set("fill-rule", fill_rule.as_str())
+                    .set("d", data);
+                p = if let Some(ref c) = fill {
+                    p.set("fill", c.as_str())
+                } else {
+                    p.set("fill", REVERSE_ICON_TEMPLATE_FILL)
+                };
+                doc.add(p)
+            }
+            ReverseIconLayer::Circle { cx, cy, r, fill } => {
+                let mut c = Circle::new()
+                    .set("cx", cx)
+                    .set("cy", cy)
+                    .set("r", r);
+                c = if let Some(ref f) = fill {
+                    c.set("fill", f.as_str())
+                } else {
+                    c.set("fill", REVERSE_ICON_TEMPLATE_FILL)
+                };
+                doc.add(c)
+            }
+            ReverseIconLayer::Ellipse {
+                cx,
+                cy,
+                rx,
+                ry,
+                fill,
+            } => {
+                let mut e = Ellipse::new()
+                    .set("cx", cx)
+                    .set("cy", cy)
+                    .set("rx", rx)
+                    .set("ry", ry);
+                e = if let Some(ref f) = fill {
+                    e.set("fill", f.as_str())
+                } else {
+                    e.set("fill", REVERSE_ICON_TEMPLATE_FILL)
+                };
+                doc.add(e)
+            }
+            ReverseIconLayer::RoundRect {
+                x,
+                y,
+                w,
+                h,
+                r,
+                fill,
+            } => {
+                let mut rect = Rectangle::new()
+                    .set("x", x)
+                    .set("y", y)
+                    .set("width", w)
+                    .set("height", h);
+                if r > 0.0 {
+                    rect = rect.set("rx", r).set("ry", r);
+                }
+                rect = if let Some(ref f) = fill {
+                    rect.set("fill", f.as_str())
+                } else {
+                    rect.set("fill", REVERSE_ICON_TEMPLATE_FILL)
+                };
+                doc.add(rect)
+            }
+        };
+    }
+
+    Ok(doc.to_string())
+}
+
+/// 从磁盘上的 `.icon` 文件生成 SVG 字符串（浏览器 `<img src="...svg">` 预览用）。
+pub fn try_convert_chromium_icon_path_to_svg_markup(icon_path: &str) -> Result<String, String> {
+    let source =
+        std::fs::read_to_string(icon_path).map_err(|e| format!("Failed to read icon file: {}", e))?;
+    try_convert_chromium_icon_source_to_svg_markup(&source)
+}
+
+/// 把 Chromium `.icon` 文件反向解析为一个 SVG 文件（用于预览或调试）。
+#[allow(dead_code)]
+pub fn convert_chromium_icon_to_svg(icon_path: &str, output_path: &str) {
+    let markup = try_convert_chromium_icon_path_to_svg_markup(icon_path)
+        .unwrap_or_else(|e| panic!("Failed to convert icon to SVG: {}", e));
+    std::fs::write(output_path, markup.as_bytes()).expect("Failed to save SVG file");
 }
 
 #[cfg(test)]
@@ -1058,6 +1484,51 @@ mod tests {
         // 与现有 chromium .icon 文件保持一致：不带 f 后缀
         assert!(!format_number(1.5).ends_with('f'));
         assert!(!format_number(-0.97).ends_with('f'));
+    }
+
+    #[test]
+    fn parse_icon_f32_token_strips_float_suffix_only() {
+        assert!((parse_icon_f32_token("554.21") - 554.21).abs() < 1e-3);
+        assert!((parse_icon_f32_token("1.5f") - 1.5).abs() < 1e-3);
+        // `0xff` 是十六进制颜色分量，不能当浮点；本函数返回 0（颜色由 `pi` 解析）。
+        assert_eq!(parse_icon_f32_token("0xff"), 0.0);
+    }
+
+    #[test]
+    fn reverse_icon_split_preserves_path_color_hex_tokens() {
+        let line = "PATH_COLOR_ARGB, 0xFF, 0xff, 0xa9, 0xb1,";
+        let parts: Vec<String> = line
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(parts[2], "0xff");
+        let s = parts[2].as_str();
+        let v = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            i64::from_str_radix(hex, 16).unwrap()
+        } else {
+            0
+        };
+        assert_eq!(v, 255);
+    }
+
+    #[test]
+    fn reverse_icon_path_color_argb_preserves_red_channel() {
+        // 这是 Chromium 标准的 ARGB 颜色行；R 字段恰好是 0xff，
+        // 之前 `trim_end_matches('f')` 会把它毁成 0x，导致 R=0。
+        let icon = "CANVAS_DIMENSIONS, 24,\nPATH_COLOR_ARGB, 0xFF, 0xff, 0xa9, 0xb1,\nMOVE_TO, 0, 0,\nLINE_TO, 1, 1,\nCLOSE,\n";
+        let svg =
+            try_convert_chromium_icon_source_to_svg_markup(icon).expect("should convert");
+        assert!(
+            svg.contains("#FFA9B1"),
+            "expected #FFA9B1 in svg, got: {}",
+            svg
+        );
+        assert!(
+            !svg.contains("#00A9B1"),
+            "should NOT contain #00A9B1 (red channel lost), got: {}",
+            svg
+        );
     }
 
     #[test]
@@ -1090,5 +1561,152 @@ mod tests {
         assert_eq!(parse_view_box_width("0 0 24 24"), Some(24.0));
         assert_eq!(parse_view_box_width("0,0,24,24"), Some(24.0));
         assert_eq!(parse_view_box_width("0 -960 960 960"), Some(960.0));
+    }
+
+    #[test]
+    fn css_strip_comments_basic() {
+        assert_eq!(strip_css_comments("a/* x */b/*y*/c"), "abc");
+        assert_eq!(strip_css_comments("a/* unterminated"), "a");
+        assert_eq!(strip_css_comments("plain"), "plain");
+    }
+
+    #[test]
+    fn css_parse_class_and_tag_selectors() {
+        let sheet = parse_svg_css(".a{fill:#ffffff;}.b{fill:#211715}path{fill-rule:evenodd}");
+        assert_eq!(sheet.get(".a").unwrap().get("fill").unwrap(), "#ffffff");
+        assert_eq!(sheet.get(".b").unwrap().get("fill").unwrap(), "#211715");
+        assert_eq!(sheet.get("path").unwrap().get("fill-rule").unwrap(), "evenodd");
+    }
+
+    #[test]
+    fn css_parse_grouped_selectors_and_comments() {
+        let sheet = parse_svg_css("/* head */ .a, .b { fill: red; } /* tail */");
+        assert_eq!(sheet.get(".a").unwrap().get("fill").unwrap(), "red");
+        assert_eq!(sheet.get(".b").unwrap().get("fill").unwrap(), "red");
+    }
+
+    /// 端到端：用 svgrepo 风格（CSS 类染色）的最小 SVG 走一次正向 + 反向，
+    /// 确保 `.icon` 里有 `PATH_COLOR_ARGB`，反向 SVG 含目标颜色。
+    /// 之前会丢色，导致预览整张图变成纯白。
+    #[test]
+    fn round_trip_class_styled_svg_keeps_color() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "chromium_icon_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg_path = dir.join("class_styled.svg");
+        let icon_name = "class_styled.icon";
+
+        let svg = r#"<?xml version="1.0"?>
+<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+  <defs><style>.a{fill:#ffa9b1;}.b{fill:#211715;}</style></defs>
+  <path class="a" d="M0,0 L10,0 L10,10 Z"/>
+  <path class="b" d="M12,12 L20,12 L20,20 Z"/>
+</svg>
+"#;
+        let mut f = std::fs::File::create(&svg_path).unwrap();
+        f.write_all(svg.as_bytes()).unwrap();
+        drop(f);
+
+        let icon_path = try_convert_svg_to_chromium_icon(svg_path.to_str().unwrap(), icon_name)
+            .expect("svg -> icon should succeed");
+        let icon_text = std::fs::read_to_string(&icon_path).unwrap();
+        assert!(
+            icon_text.contains("PATH_COLOR_ARGB, 0xFF, 0xff, 0xa9, 0xb1,"),
+            "missing class .a color in .icon, got: {}",
+            icon_text
+        );
+        assert!(
+            icon_text.contains("PATH_COLOR_ARGB, 0xFF, 0x21, 0x17, 0x15,"),
+            "missing class .b color in .icon, got: {}",
+            icon_text
+        );
+
+        let svg_back = try_convert_chromium_icon_path_to_svg_markup(&icon_path)
+            .expect("icon -> svg should succeed");
+        assert!(
+            svg_back.contains("#FFA9B1"),
+            "reverse svg lost class .a color, got: {}",
+            svg_back
+        );
+        assert!(
+            svg_back.contains("#211715"),
+            "reverse svg lost class .b color, got: {}",
+            svg_back
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `viewBox="… 464.955 464.955"` 这类非整数画布在旧版本会写成
+    /// `CANVAS_DIMENSIONS, 464.95,`，Chromium 端按整数解析时会失败。
+    /// 现在必须四舍五入到整数。
+    #[test]
+    fn canvas_dimensions_rounded_to_integer() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "chromium_icon_canvas_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg_path = dir.join("non_integer_viewbox.svg");
+        let icon_name = "non_integer_viewbox.icon";
+
+        let svg = r##"<?xml version="1.0"?>
+<svg width="800px" height="800px" viewBox="-33.71 0 464.955 464.955" xmlns="http://www.w3.org/2000/svg">
+  <path fill="#ff0000" d="M0 0 L10 10 Z"/>
+</svg>
+"##;
+        let mut f = std::fs::File::create(&svg_path).unwrap();
+        f.write_all(svg.as_bytes()).unwrap();
+        drop(f);
+
+        let icon_path = try_convert_svg_to_chromium_icon(svg_path.to_str().unwrap(), icon_name)
+            .expect("svg -> icon should succeed");
+        let icon_text = std::fs::read_to_string(&icon_path).unwrap();
+        assert!(
+            icon_text.contains("CANVAS_DIMENSIONS, 465,"),
+            "expected rounded integer 465, got: {}",
+            icon_text.lines().take(8).collect::<Vec<_>>().join("\\n")
+        );
+        assert!(
+            !icon_text.contains("CANVAS_DIMENSIONS, 464.95"),
+            "fractional CANVAS_DIMENSIONS leaked through: {}",
+            icon_text
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 历史 .icon 里残留的 `CANVAS_DIMENSIONS, 464.95,` 在反向解析时也要按整数对齐，
+    /// 否则生成的 SVG `viewBox`/`width`/`height` 会跟 Chromium 期望不符。
+    #[test]
+    fn reverse_canvas_dimensions_rounds_legacy_fraction() {
+        let icon = "CANVAS_DIMENSIONS, 464.95,\nMOVE_TO, 0, 0,\nLINE_TO, 1, 1,\nCLOSE,\n";
+        let svg = try_convert_chromium_icon_source_to_svg_markup(icon).expect("should convert");
+        assert!(
+            svg.contains("viewBox=\"0 0 465 465\""),
+            "expected rounded viewBox 0 0 465 465, got: {}",
+            svg
+        );
+    }
+
+    #[test]
+    fn inline_style_overrides_class_and_attribute() {
+        let mut sheet: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+            std::collections::HashMap::new();
+        sheet.insert(
+            ".x".to_string(),
+            [("fill".to_string(), "#abcdef".to_string())].into_iter().collect(),
+        );
+        let mut attrs: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        attrs.insert("class".to_string(), Value::from("x"));
+        attrs.insert("fill".to_string(), Value::from("#000000"));
+        attrs.insert("style".to_string(), Value::from("fill: #ff0000"));
+
+        let resolved = resolve_svg_styles(&sheet, &attrs, "path");
+        assert_eq!(resolved.get("fill").unwrap().to_string(), "#ff0000");
     }
 }
