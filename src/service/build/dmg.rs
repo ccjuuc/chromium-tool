@@ -1,6 +1,13 @@
+// 该模块仅在 macOS 平台才有功能实现：所有公开/内部函数都用
+// `#[cfg(target_os = "macos")]` gate 掉了。`appdmg-rs` 是 macOS 专属依赖，
+// 因此 `use` 也必须 gate，否则在 Windows / Linux 上会找不到 crate。
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
 use appdmg_rs::{DmgConfig, DmgContent, DmgWindow, DmgWindowSize};
+#[cfg(target_os = "macos")]
 use crate::service::build::installer::InstallerBuilder;
 
 #[cfg(target_os = "macos")]

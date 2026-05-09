@@ -45,10 +45,6 @@ pub fn create_router(state: AppState) -> Router {
         .route("/custom_args_list", get(handlers::config::custom_args_list))
         .route("/build_args_list", get(handlers::config::build_args_list))
         
-        // ID 查找路由
-        .route("/generate_id", post(handlers::id_finder::generate_id))
-        .route("/search_id", post(handlers::id_finder::search_id))
-        
         // CORS 层应该在最后，确保所有路由都应用
         .layer(cors)
         .with_state(state)

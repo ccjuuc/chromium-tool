@@ -149,6 +149,11 @@ windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
 byteorder = "1.5.0"
 plist = "1.8.0"
 serde_bytes = "0.11.19"
+
+# appdmg-rs 仅在 macOS 上需要（用于打 .dmg 包），它依赖 tokio::fs::symlink、
+# std::os::unix::fs::MetadataExt 等 Unix 专属 API，在 Windows / Linux 上无法编译。
+# 平台 gate 到 macOS 后，cargo 在其他平台不会拉取/编译它。
+[target.'cfg(target_os = "macos")'.dependencies]
 appdmg-rs = { git = "https://github.com/ccjuuc/appdmg-rs.git" }
 
 

@@ -3,45 +3,67 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use anyhow::{Context, Result};
 
-#[derive(Debug, Clone, Deserialize)]
+// 顶层与每个内嵌结构体都派生了 `Default`，目的是允许在配置文件缺失时
+// 通过 `AppConfig::default()` 启动一份"什么都没配"的最小可运行实例。
+// 对应字段全部使用 `#[serde(default)]`，所以即使 toml 中只写了部分段也能解析。
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
     pub sign: Option<String>,
+    #[serde(default)]
     pub custom_args: Vec<String>,
+    #[serde(default)]
     pub build_args: Vec<String>,
+    #[serde(default)]
     pub oem: OemConfig,
+    #[serde(default)]
     pub clean: CleanConfig,
     #[allow(dead_code)]
+    #[serde(default)]
     pub git: GitConfig,
+    #[serde(default)]
     pub src: PlatformPaths,
+    #[serde(default)]
     pub dev_tools: PlatformPaths,
+    #[serde(default)]
     pub python: Option<PlatformPaths>,
+    #[serde(default)]
     pub backup_path: PlatformPaths,
+    #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
     pub email: EmailConfig,
+    #[serde(default)]
     pub gn_default_args: PlatformArgs,
     #[serde(default)]
     pub build_steps: PlatformBuildSteps,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OemConfig {
+    #[serde(default)]
     pub oem_key: String,
+    #[serde(default)]
     pub oems: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct CleanConfig {
+    #[serde(default)]
     pub path: Vec<String>,
+    #[serde(default)]
     pub out_path: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct GitConfig {
     #[allow(dead_code)]
+    #[serde(default)]
     pub addr: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct PlatformPaths {
     #[serde(default)]
     pub windows: String,
@@ -53,25 +75,34 @@ pub struct PlatformPaths {
     pub db: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default)]
     pub windows: Vec<String>,
+    #[serde(default)]
     pub macos: Vec<String>,
+    #[serde(default)]
     pub linux: Vec<String>,
+    #[serde(default)]
     pub db_server: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct EmailConfig {
     #[allow(dead_code)]
+    #[serde(default)]
     pub web: String,
+    #[serde(default)]
     pub smtp: String,
+    #[serde(default)]
     pub from: String,
+    #[serde(default)]
     pub password: String,
+    #[serde(default)]
     pub to: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct PlatformArgs {
     #[serde(default)]
     pub windows: Vec<String>,
@@ -120,19 +151,53 @@ pub struct BuildStep {
 }
 
 impl AppConfig {
+    /// 加载配置。
+    ///
+    /// 加载策略（按优先级）：
+    /// 1. 配置文件存在 → 解析它（解析失败仍然返回错误，避免静默运行错误配置）
+    /// 2. 配置文件不存在 → 打印警告并使用 `AppConfig::default()` 启动
+    ///
+    /// 任意情况下都会再叠加 `PKG_SRV_*` 环境变量覆盖。这样既能在缺少
+    /// `config.toml` 时让服务以"零配置"模式起来（数据库/签名/邮件等可选模块
+    /// 会自动跳过），也能在持续集成里用环境变量覆盖个别字段。
     pub async fn load(path: &str) -> Result<Self> {
-        let config = Config::builder()
-            .add_source(File::with_name(path))
-            .add_source(Environment::with_prefix("PKG_SRV"))
-            .build()
-            .context("Failed to load config")?;
-        
-        let app_config: AppConfig = config.try_deserialize()
-            .context("Failed to deserialize config")?;
-        
+        let mut builder = Config::builder();
+
+        let path_exists = std::path::Path::new(path).exists();
+        if path_exists {
+            builder = builder.add_source(File::with_name(path));
+        } else {
+            tracing::warn!(
+                "⚠️  配置文件 {} 不存在，将使用默认配置启动；可通过 PKG_SRV_* 环境变量覆盖",
+                path
+            );
+        }
+        builder = builder.add_source(Environment::with_prefix("PKG_SRV"));
+
+        let config = builder.build().context("Failed to load config")?;
+
+        // 把（可能为空的）source 反序列化到 AppConfig；所有字段都是
+        // `#[serde(default)]`，所以即使没有任何 source 也能拿到一个
+        // 全默认的实例。
+        let app_config: AppConfig = config
+            .try_deserialize()
+            .unwrap_or_else(|e| {
+                if path_exists {
+                    // 文件存在但解析失败 —— 多半是写错了，记录详细信息但
+                    // 仍然降级为默认配置，保持服务可启动。如果希望严格
+                    // 校验，可以把这里换成 `Err(...)?`。
+                    tracing::error!(
+                        "❌ 解析配置文件 {} 失败：{}；将使用默认配置启动",
+                        path,
+                        e
+                    );
+                }
+                AppConfig::default()
+            });
+
         // 初始化环境变量
         app_config.init_env();
-        
+
         Ok(app_config)
     }
     

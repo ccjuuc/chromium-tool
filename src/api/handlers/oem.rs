@@ -3,7 +3,8 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse},
 };
-use std::env::current_dir;
+use std::env::{current_dir, var_os};
+use std::path::PathBuf;
 use base64::engine::general_purpose::STANDARD;
 use base64::engine::Engine;
 use crate::model::oem::{ConvertRequest, OemRequest, CornerRequest};
@@ -15,12 +16,44 @@ pub async fn oem_page() -> impl IntoResponse {
     Html(html_content.to_string())
 }
 
+/// 格式转换的输入/输出目录。
+///
+/// - 默认：`{进程当前工作目录}/convert_output/`（与 OEM 的 `oem_logo/` 类似，避免把文件散在 CWD 根目录）
+/// - 可设置环境变量 `CHROMIUM_TOOL_CONVERT_DIR` 为绝对路径，强制输出到指定文件夹（例如 `H:\chromium-tool\out`）
+///
+/// 说明：若你看到文件在 `C:\...`，是因为**启动服务时 shell 的当前目录在 C 盘**（例如在
+/// `C:\Users\...\AppData\Local\Temp` 下运行了 exe），不是程序“写死 C 盘”。
+fn convert_work_dir() -> Result<PathBuf, std::io::Error> {
+    if let Some(raw) = var_os("CHROMIUM_TOOL_CONVERT_DIR") {
+        let p = PathBuf::from(raw);
+        if !p.as_os_str().is_empty() {
+            return Ok(p);
+        }
+    }
+    Ok(current_dir()?.join("convert_output"))
+}
+
 pub async fn convert_image(Json(payload): Json<ConvertRequest>) -> impl IntoResponse {
-    
-    let logo_path_buf = match current_dir() {
-        Ok(dir) => dir.join(&payload.logo_name),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get current dir: {}", e)).into_response(),
+    let work_dir = match convert_work_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to resolve convert output directory: {}", e),
+            )
+                .into_response();
+        }
     };
+
+    if let Err(e) = std::fs::create_dir_all(&work_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create convert output directory {}: {}", work_dir.display(), e),
+        )
+            .into_response();
+    }
+
+    let logo_path_buf = work_dir.join(&payload.logo_name);
     
     let logo_path = match logo_path_buf.to_str() {
         Some(path) => path,
@@ -38,22 +71,72 @@ pub async fn convert_image(Json(payload): Json<ConvertRequest>) -> impl IntoResp
     
     let output_path = &payload.output_path;
     let format = &payload.format;
-    
-    let ret = match format.as_str() {
-        "ICO" => image_util::generate_chromium_ico(logo_path, output_path),
-        "ICON" => chromium_icon::convert_svg_to_chromium_icon(logo_path, output_path),
-        "ICNS" => image_util::generate_chromium_icns(logo_path, output_path, true),
-        "PNG" => {
-            if logo_path.ends_with(".svg") {
-                svg_png::convert_svg_to_png(logo_path, output_path)
-            } else {
-                return (StatusCode::BAD_REQUEST, "svg file is required for PNG conversion").into_response();
+
+    tracing::info!(
+        "convert_image: logo='{}', output='{}', format='{}', size={}",
+        payload.logo_name,
+        output_path,
+        format,
+        logo_data.len()
+    );
+
+    // 把可能 panic 的转换函数放到 catch_unwind 里，确保即便底层 svg 解析
+    // 等地方 panic，也能把可读的错误回给前端而不是返回空 500。
+    let logo_path_owned = logo_path.to_string();
+    let output_path_owned = output_path.clone();
+    let format_owned = format.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        match format_owned.as_str() {
+            "ICO" => Ok(image_util::generate_chromium_ico(
+                &logo_path_owned,
+                &output_path_owned,
+            )),
+            "ICON" => chromium_icon::try_convert_svg_to_chromium_icon(
+                &logo_path_owned,
+                &output_path_owned,
+            ),
+            "ICNS" => Ok(image_util::generate_chromium_icns(
+                &logo_path_owned,
+                &output_path_owned,
+                true,
+            )),
+            "PNG" => {
+                if logo_path_owned.ends_with(".svg") {
+                    Ok(svg_png::convert_svg_to_png(&logo_path_owned, &output_path_owned))
+                } else {
+                    Err("svg file is required for PNG conversion".to_string())
+                }
             }
+            other => Err(format!("Unsupported format: {}", other)),
         }
-        _ => return (StatusCode::BAD_REQUEST, "Unsupported format").into_response(),
-    };
-    
-    (StatusCode::OK, ret).into_response()
+    }));
+
+    match result {
+        Ok(Ok(ret)) => {
+            tracing::info!("convert_image ok: {}", ret);
+            (StatusCode::OK, ret).into_response()
+        }
+        Ok(Err(msg)) => {
+            tracing::error!("convert_image error: {}", msg);
+            (StatusCode::BAD_REQUEST, msg).into_response()
+        }
+        Err(panic_payload) => {
+            // panic 信息可能是 &str 或 String
+            let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "panic without message".to_string()
+            };
+            tracing::error!("convert_image panicked: {}", msg);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Conversion panicked: {}", msg),
+            )
+                .into_response()
+        }
+    }
 }
 
 pub async fn oem_convert(Json(payload): Json<OemRequest>) -> impl IntoResponse {
