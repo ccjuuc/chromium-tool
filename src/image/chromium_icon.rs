@@ -39,19 +39,32 @@ use svg::Document;
 ///
 /// 虽然 `vector_icon_utils.cc::ParsePathElement` 也能解析末尾带 `f` 的数字，
 /// 但与既有 .icon 文件保持一致，这里不输出 `f` 后缀。
+/// 坐标"近整数吸附"阈值：与最近整数的距离 ≤ 此值时直接吸附到整数。
+///
+/// 目的：本应落在整数像素网格上的边缘，常因浮点运算（旋转/缩放/平移）或导出工具
+/// 的微小误差偏移一点点（如 `11.9998`、`2.0001`），在渲染时跨越像素边界而发虚。
+/// 吸附回整数即可规避。阈值 0.05 远小于 1px 描边常用的 `.5` 居中（距整数 0.5），
+/// 因此**不会**破坏 `1.5 / 2.5` 这类有意的半像素锐利描边。
+const COORD_INTEGER_SNAP_EPS: f32 = 0.05;
+
 fn format_number(num: f32) -> String {
     if num.is_nan() {
         return "0".to_string();
     }
-    // 整数直接以整数形式输出（避免 `1.0` 这种冗余小数位）。
-    if num.fract() == 0.0 && num.abs() < 1.0e9 {
-        return format!("{}", num as i64);
+
+    // 接近整数（含精确整数）的值统一吸附到整数：既避免 `1.0` 这类冗余小数，
+    // 也消除浮点噪声/导出误差导致的非整数发虚。
+    let nearest = num.round();
+    if (num - nearest).abs() <= COORD_INTEGER_SNAP_EPS && nearest.abs() < 1.0e9 {
+        let n = nearest as i64;
+        // 避免 `-0`。
+        return format!("{}", if n == 0 { 0 } else { n });
     }
 
-    // 保留 2 位小数（向零截断），并去掉末尾多余的 0 与可能残留的小数点。
-    // 注意正负数都使用一致的截断策略，避免出现非对称的舍入。
-    let truncated = (num * 100.0).trunc() / 100.0;
-    let mut s = format!("{:.2}", truncated);
+    // 其余值四舍五入到 2 位小数（此前为截断：会让 6.999 落成 6.99 反而更偏），
+    // 再去掉末尾多余的 0 与可能残留的小数点。
+    let rounded = (num * 100.0).round() / 100.0;
+    let mut s = format!("{:.2}", rounded);
     if s.contains('.') {
         while s.ends_with('0') {
             s.pop();
@@ -2201,7 +2214,24 @@ mod tests {
         assert_eq!(format_number(-1.5), "-1.5");
         assert_eq!(format_number(0.5), "0.5");
         assert_eq!(format_number(0.25), "0.25");
-        assert_eq!(format_number(-0.97), "-0.97");
+        // -0.97 距 -1 仅 0.03（≤ 吸附阈值）→ 吸附到整数 -1。
+        assert_eq!(format_number(-0.97), "-1");
+    }
+
+    #[test]
+    fn format_number_snaps_near_integer_and_rounds() {
+        // 浮点噪声/导出误差吸附到整数网格，规避非整数发虚。
+        assert_eq!(format_number(11.9998), "12");
+        assert_eq!(format_number(2.0001), "2");
+        assert_eq!(format_number(-0.0001), "0");
+        assert_eq!(format_number(7.04), "7");
+        // 有意的半像素描边（.5 居中）必须保留。
+        assert_eq!(format_number(1.5), "1.5");
+        assert_eq!(format_number(2.5), "2.5");
+        // 远离整数的真实分数：四舍五入到 2 位（而非截断）。
+        assert_eq!(format_number(6.11084), "6.11");
+        assert_eq!(format_number(6.699), "6.7");
+        assert_eq!(format_number(0.125), "0.13");
     }
 
     #[test]
