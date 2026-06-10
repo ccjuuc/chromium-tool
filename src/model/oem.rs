@@ -7,6 +7,10 @@ pub struct ConvertRequest {
     pub output_path: String,
     #[serde(default = "default_format")]
     pub format: String,
+    /// 仅当 `format` 为 **ICON**（SVG→`.icon`）时生效。默认 `true`。为 `false`
+    /// 时不写入 `PATH_COLOR_ARGB`，由 Chromium 运行时模板色上色。
+    #[serde(default)]
+    pub emit_path_colors: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

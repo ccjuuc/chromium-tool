@@ -343,7 +343,7 @@
     <div class="container">
         <div class="header">
             <h1>🛠️ Chromium 工具集</h1>
-            <p>图像转换与 OEM 等工具</p>
+            <p>图像转换与 OEM 等工具 · <a href="/oem/icon_preview" style="color:#fff;text-decoration:underline;text-underline-offset:4px;font-weight:600">批量 .icon 预览</a></p>
         </div>
 
         <div class="cards">
@@ -363,6 +363,12 @@
                             <option value=".png">.png</option>
                             <option value=".svg">.svg</option>
                         </select>
+                    </div>
+                    <div class="form-group" id="convert_emit_path_colors_row">
+                        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-weight:600;">
+                            <input type="checkbox" id="convert_emit_path_colors" name="emit_path_colors" checked>
+                            <span>在 .icon 中写入 PATH_COLOR_ARGB（关闭后由 Chromium 运行时上色）</span>
+                        </label>
                     </div>
                     <div class="preview-row" id="convert_preview_row" hidden>
                         <div class="preview-col">
@@ -537,6 +543,12 @@
             if (file && cur && cur.disabled && firstEnabledIndex >= 0) {
                 select.selectedIndex = firstEnabledIndex;
             }
+
+            const emitRow = document.getElementById('convert_emit_path_colors_row');
+            if (emitRow && select) {
+                const out = select.options[select.selectedIndex].value.toLowerCase();
+                emitRow.hidden = out !== '.icon';
+            }
         }
 
         let convertSrcObjectUrl = null;
@@ -623,6 +635,9 @@
             updateConvertSuffixOptions();
             refreshConvertSourcePreview();
         });
+        document.getElementById('convert_output_suffix').addEventListener('change', function () {
+            updateConvertSuffixOptions();
+        });
         updateConvertSuffixOptions();
         refreshConvertSourcePreview();
 
@@ -654,6 +669,11 @@
                         output_path,
                         format
                     };
+                    if (format === 'ICON') {
+                        payload.emit_path_colors = document.getElementById(
+                            'convert_emit_path_colors'
+                        ).checked;
+                    }
 
                     const response = await fetch(`${API_BASE}/convert_image`, {
                         method: 'POST',

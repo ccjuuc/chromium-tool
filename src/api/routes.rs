@@ -17,8 +17,18 @@ pub fn create_router(state: AppState) -> Router {
         .max_age(std::time::Duration::from_secs(3600));
     
     Router::new()
-        // OEM 路由
+        // OEM 路由（根路径默认进入 OEM 页面）
+        .route("/", get(handlers::oem::oem_page))
         .route("/oem", get(handlers::oem::oem_page))
+        .route(
+            "/oem/icon_preview",
+            get(handlers::oem::icon_batch_preview_page),
+        )
+        .route("/icon_preview_list", get(handlers::oem::list_icon_preview_files))
+        .route(
+            "/icon_preview_batch_convert",
+            post(handlers::oem::icon_preview_batch_convert),
+        )
         .route("/convert_image", post(handlers::oem::convert_image))
         .route("/convert_output/:file_name", get(handlers::oem::get_convert_output))
         .route(
@@ -29,7 +39,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/add_rounded_corners", post(handlers::oem::add_rounded_corners))
         
         // 构建路由（限制并发为 1）
-        .route("/", get(handlers::build::build_page))
+        .route("/build", get(handlers::build::build_page))
         .route("/build_package", post(handlers::build::build_package))
         .layer(ConcurrencyLimitLayer::new(1))  // 高优先级：限流
         

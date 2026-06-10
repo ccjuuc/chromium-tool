@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>批量 .icon 预览 - Chromium Tool</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 24px;
+            color: #333;
+        }
+        .container { max-width: 840px; margin: 0 auto; }
+        .header { text-align: center; color: #fff; margin-bottom: 28px; }
+        .header h1 { font-size: 1.75rem; margin-bottom: 8px; text-shadow: 0 1px 3px rgba(0,0,0,.2); }
+        .header a {
+            color: #fff; opacity: .95; font-size: .95rem;
+            text-decoration: underline; text-underline-offset: 4px;
+        }
+        .toolbar {
+            background: #fff;
+            border-radius: 12px;
+            padding: 18px 22px;
+            box-shadow: 0 8px 28px rgba(0,0,0,.12);
+            margin-bottom: 20px;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: flex-end;
+            gap: 18px 24px;
+        }
+        .toolbar-field label {
+            display: block;
+            font-size: .85rem;
+            font-weight: 600;
+            color: #555;
+            margin-bottom: 6px;
+        }
+        .toolbar-field input[type="number"] {
+            width: 100px;
+            padding: 10px 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1rem;
+        }
+        .toolbar-field input[type="text"] {
+            min-width: 260px;
+            flex: 1 1 320px;
+            padding: 10px 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: .92rem;
+            font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+        }
+        .toolbar-field input:focus { outline: none; border-color: #667eea; }
+        .toolbar-field-grow { flex: 1 1 100%; max-width: 100%; }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: #fff;
+            font-weight: 600;
+            cursor: pointer;
+            font-size: .95rem;
+        }
+        .btn:hover { filter: brightness(1.05); }
+        .btn:disabled { opacity: 0.55; cursor: not-allowed; filter: none; }
+        .btn-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+        .hint {
+            font-size: .8rem;
+            color: #777;
+            flex: 1 1 100%;
+            margin-top: -4px;
+        }
+        #dirPath { font-family: ui-monospace, monospace; font-size: .78rem; color: #666; word-break: break-all; flex: 1 1 100%; }
+        .list {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            align-items: flex-start;
+            width: max-content;
+            max-width: 100%;
+            margin: 0 auto;
+            background: rgba(255,255,255,.12);
+            padding: 6px;
+            border-radius: 8px;
+        }
+        .bg-options {
+            display: flex;
+            gap: 14px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .bg-options label {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: .9rem;
+            font-weight: 600;
+            color: #555;
+            cursor: pointer;
+            margin: 0;
+        }
+        .preview-cell {
+            display: block;
+            line-height: 0;
+            border-radius: 4px;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+        .preview-cell.bg-light { background: #ffffff; }
+        .preview-cell.bg-dark { background: #111111; }
+        .preview-img {
+            display: block;
+            object-fit: contain;
+            image-rendering: -webkit-optimize-contrast;
+            image-rendering: crisp-edges;
+            vertical-align: top;
+        }
+        #empty, #loadErr {
+            text-align: center;
+            color: #fff;
+            padding: 32px;
+            font-size: 1rem;
+        }
+        #batchSummary {
+            color: #fff;
+            font-size: 0.88rem;
+            margin-bottom: 14px;
+            padding: 12px 14px;
+            background: rgba(0, 0, 0, 0.22);
+            border-radius: 8px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-width: 100%;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>批量 .icon 预览</h1>
+            <p><a href="/oem">← 返回图像转换</a></p>
+        </div>
+
+        <div class="toolbar">
+            <div class="toolbar-field toolbar-field-grow">
+                <label for="scanRoot">工作目录</label>
+                <input type="text" id="scanRoot" placeholder="例：H:\project\icons（批量转换必填；将把其中全部 *.svg 生成同路径下的 .icon）" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="toolbar-field">
+                <label for="previewSize">预览边长 (px)</label>
+                <input type="number" id="previewSize" min="16" max="512" value="64" step="1">
+            </div>
+            <div class="toolbar-field">
+                <span class="toolbar-field" style="display:block;margin:0;">
+                    <span style="display:block;font-size:.85rem;font-weight:600;color:#555;margin-bottom:6px;">预览背景</span>
+                    <span class="bg-options" role="radiogroup" aria-label="预览背景">
+                        <label><input type="radio" name="previewBg" value="light" checked> 白底</label>
+                        <label><input type="radio" name="previewBg" value="dark"> 黑底</label>
+                    </span>
+                </span>
+            </div>
+            <div class="btn-row">
+                <label class="toolbar-field" style="display:flex;align-items:center;gap:8px;margin:0;font-size:.9rem;font-weight:600;color:#555;">
+                    <input type="checkbox" id="emitPathColors" checked>
+                    写入 PATH_COLOR
+                </label>
+                <button type="button" class="btn" id="batchConvertBtn">SVG 全部 → .icon 并预览</button>
+                <button type="button" class="btn" id="refreshBtn">仅刷新预览</button>
+            </div>
+            <p class="hint">
+                工作目录<strong>必须由您填写路径</strong>：点「SVG 全部 → .icon」会枚举该目录下所有 <code>.svg</code>，在同目录生成 <code>.icon</code>（与单文件转换逻辑一致），不读取环境变量。取消勾选「写入 PATH_COLOR」时生成的 <code>.icon</code> 不含颜色行，交由 Chromium 运行时模板色上色。随后自动按该目录列出预览图（仅预览图纵向排列，间距 3px）。若只查看已有 <code>.icon</code> 也可填目录后点「仅刷新预览」。
+            </p>
+            <p id="dirPath" aria-live="polite"></p>
+        </div>
+
+        <div id="batchSummary" hidden></div>
+
+        <div id="loadErr" hidden></div>
+        <div id="empty" hidden>当前目录下没有找到 .icon 文件。请调整目录或先在「格式转换」中导出 .icon。</div>
+        <div class="list" id="iconList"></div>
+    </div>
+
+    <script>
+        (function () {
+            var sizeInput = document.getElementById('previewSize');
+            var scanRootInput = document.getElementById('scanRoot');
+            var refreshBtn = document.getElementById('refreshBtn');
+            var batchConvertBtn = document.getElementById('batchConvertBtn');
+            var iconList = document.getElementById('iconList');
+            var emptyEl = document.getElementById('empty');
+            var loadErr = document.getElementById('loadErr');
+            var dirPath = document.getElementById('dirPath');
+            var batchSummary = document.getElementById('batchSummary');
+            var previewBgRadios = document.querySelectorAll('input[name="previewBg"]');
+            /** @type {boolean} */
+            var useRootQuery = false;
+            /** @type {string} */
+            var canonicalRootForQuery = '';
+
+            function clampSize() {
+                var n = parseInt(sizeInput.value, 10);
+                if (isNaN(n)) n = 64;
+                n = Math.min(512, Math.max(16, n));
+                sizeInput.value = String(n);
+                return n;
+            }
+
+            function previewBgClass() {
+                var selected = document.querySelector('input[name="previewBg"]:checked');
+                return selected && selected.value === 'dark' ? 'bg-dark' : 'bg-light';
+            }
+
+            function applyPreviewBg() {
+                var bg = previewBgClass();
+                iconList.querySelectorAll('.preview-cell').forEach(function (cell) {
+                    cell.classList.remove('bg-light', 'bg-dark');
+                    cell.classList.add(bg);
+                    var img = cell.querySelector('.preview-img');
+                    if (!img) return;
+                    var name = img.getAttribute('aria-label') || img.title;
+                    if (name) img.src = svgUrl(name);
+                });
+            }
+
+            function svgUrl(name) {
+                var u = '/convert_output_svg/' + encodeURIComponent(name).replace(/'/g, '%27');
+                var params = [];
+                if (useRootQuery && canonicalRootForQuery.length > 0) {
+                    params.push('root=' + encodeURIComponent(canonicalRootForQuery));
+                }
+                if (previewBgClass() === 'bg-dark') {
+                    params.push('bg=dark');
+                }
+                if (params.length) u += '?' + params.join('&');
+                return u;
+            }
+
+            function render(icons) {
+                var px = clampSize();
+                var bg = previewBgClass();
+                iconList.innerHTML = '';
+                icons.forEach(function (name) {
+                    var cell = document.createElement('div');
+                    cell.className = 'preview-cell ' + bg;
+                    cell.style.width = px + 'px';
+                    cell.style.height = px + 'px';
+                    var img = document.createElement('img');
+                    img.className = 'preview-img';
+                    img.width = px;
+                    img.height = px;
+                    img.src = svgUrl(name);
+                    img.loading = 'lazy';
+                    img.alt = '';
+                    img.setAttribute('aria-label', name);
+                    img.title = name;
+                    img.onerror = function () {
+                        img.alt = '!';
+                        img.style.background = 'rgba(220,220,230,.95)';
+                        img.style.minWidth = px + 'px';
+                        img.style.minHeight = px + 'px';
+                    };
+                    cell.appendChild(img);
+                    iconList.appendChild(cell);
+                });
+            }
+
+            function applySizesOnly() {
+                var px = clampSize();
+                iconList.querySelectorAll('.preview-cell').forEach(function (cell) {
+                    cell.style.width = px + 'px';
+                    cell.style.height = px + 'px';
+                    var img = cell.querySelector('.preview-img');
+                    if (!img) return;
+                    img.width = px;
+                    img.height = px;
+                    if (img.alt === '!') {
+                        img.style.minWidth = px + 'px';
+                        img.style.minHeight = px + 'px';
+                    }
+                });
+            }
+
+            async function batchConvertAndPreview() {
+                var trimmed = scanRootInput.value.trim();
+                if (!trimmed) {
+                    loadErr.textContent = '请先在「工作目录」填写要批量转换的文件夹路径。';
+                    loadErr.hidden = false;
+                    return;
+                }
+                loadErr.hidden = true;
+                batchSummary.hidden = true;
+                batchConvertBtn.disabled = true;
+                refreshBtn.disabled = true;
+                try {
+                    var res = await fetch('/icon_preview_batch_convert', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            directory: trimmed,
+                            emit_path_colors: document.getElementById('emitPathColors').checked,
+                        }),
+                    });
+                    var raw = await res.text();
+                    var data = null;
+                    try {
+                        data = raw ? JSON.parse(raw) : null;
+                    } catch (ignore) {}
+                    if (!res.ok) {
+                        throw new Error(raw || ('HTTP ' + res.status));
+                    }
+                    batchSummary.textContent = data.summary || '';
+                    if (data.errors && data.errors.length) {
+                        batchSummary.textContent +=
+                            '\n\n失败明细：\n' +
+                            data.errors.map(function (e) {
+                                return e.file + ': ' + e.message;
+                            }).join('\n');
+                    }
+                    batchSummary.hidden = false;
+                    await fetchList();
+                } catch (e) {
+                    loadErr.textContent = '批量转换失败：' + e.message;
+                    loadErr.hidden = false;
+                } finally {
+                    batchConvertBtn.disabled = false;
+                    refreshBtn.disabled = false;
+                }
+            }
+
+            async function fetchList() {
+                loadErr.hidden = true;
+                emptyEl.hidden = true;
+                iconList.innerHTML = '';
+                var trimmedRoot = scanRootInput.value.trim();
+                useRootQuery = trimmedRoot.length > 0;
+                try {
+                    var url = '/icon_preview_list';
+                    if (useRootQuery) {
+                        url += '?root=' + encodeURIComponent(trimmedRoot);
+                    }
+                    var res = await fetch(url);
+                    if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text().catch(function () { return ''; })));
+                    var data = await res.json();
+                    canonicalRootForQuery = ((data.directory || '') + '').trim();
+                    dirPath.textContent = data.directory ? '当前目录：' + data.directory : '';
+                    var icons = data.icons || [];
+                    if (icons.length === 0) {
+                        emptyEl.hidden = false;
+                        return;
+                    }
+                    emptyEl.hidden = true;
+                    render(icons);
+                } catch (e) {
+                    loadErr.textContent = '加载列表失败：' + e.message;
+                    loadErr.hidden = false;
+                    useRootQuery = false;
+                    canonicalRootForQuery = '';
+                }
+            }
+
+            sizeInput.addEventListener('input', function () {
+                if (iconList.querySelector('.preview-cell')) applySizesOnly();
+            });
+            sizeInput.addEventListener('change', clampSize);
+
+            previewBgRadios.forEach(function (radio) {
+                radio.addEventListener('change', function () {
+                    if (iconList.querySelector('.preview-cell')) applyPreviewBg();
+                });
+            });
+
+            scanRootInput.addEventListener('keydown', function (ev) {
+                if (ev.key === 'Enter') fetchList();
+            });
+
+            refreshBtn.addEventListener('click', fetchList);
+            batchConvertBtn.addEventListener('click', batchConvertAndPreview);
+            fetchList();
+        })();
+    </script>
+</body>
+</html>
