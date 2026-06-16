@@ -717,6 +717,134 @@ fn parse_svg_transform(s: &str) -> Option<Affine> {
     }
 }
 
+/// 解析 `url(#id)` / `url("#id")` 形式的 SVG 引用，返回 `#` 后的 id。
+fn parse_svg_url_ref(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if !s.starts_with("url(") || !s.ends_with(')') {
+        return None;
+    }
+    let inner = s[4..s.len() - 1].trim();
+    let inner = inner.strip_prefix('#').unwrap_or(inner);
+    let inner = inner.trim_matches('"').trim_matches('\'').trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_string())
+    }
+}
+
+/// `<mask>` 内用于裁剪的矩形几何（Figma 等导出「内描边」时的典型结构）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SvgMaskRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+}
+
+fn parse_svg_rect_geometry(attributes: &std::collections::HashMap<String, Value>) -> SvgMaskRect {
+    let x = parse_attr_f32(attributes, "x", 0.0);
+    let y = parse_attr_f32(attributes, "y", 0.0);
+    let w = parse_attr_f32(attributes, "width", 0.0);
+    let h = parse_attr_f32(attributes, "height", 0.0);
+    let rx_attr = attributes.get("rx").and_then(parse_dim).map(|d| d as f32);
+    let ry_attr = attributes.get("ry").and_then(parse_dim).map(|d| d as f32);
+    let r = match (rx_attr, ry_attr) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => 0.0,
+    };
+    SvgMaskRect { x, y, w, h, r }
+}
+
+fn svg_mask_rects_approx_equal(a: SvgMaskRect, b: SvgMaskRect, eps: f32) -> bool {
+    (a.x - b.x).abs() <= eps
+        && (a.y - b.y).abs() <= eps
+        && (a.w - b.w).abs() <= eps
+        && (a.h - b.h).abs() <= eps
+        && (a.r - b.r).abs() <= eps
+}
+
+/// 从 SVG 事件流收集 `<mask id="…">` 内 `<rect>` 几何，供识别「内描边」mask 模式。
+fn collect_svg_mask_rects(events: &[Event]) -> std::collections::HashMap<String, Vec<SvgMaskRect>> {
+    let mut out: std::collections::HashMap<String, Vec<SvgMaskRect>> =
+        std::collections::HashMap::new();
+    let mut mask_id_stack: Vec<String> = Vec::new();
+    let mut mask_depth: usize = 0;
+
+    for event in events {
+        match event {
+            Event::Tag(name, t, attrs) if name.eq_ignore_ascii_case("mask") => match t {
+                Type::Start | Type::Empty => {
+                    let id = attrs
+                        .get("id")
+                        .map(|v| v.to_string())
+                        .unwrap_or_default();
+                    mask_id_stack.push(id);
+                    mask_depth += 1;
+                }
+                Type::End => {
+                    mask_id_stack.pop();
+                    mask_depth = mask_depth.saturating_sub(1);
+                }
+            },
+            Event::Tag("rect", t, attrs)
+                if matches!(t, Type::Start | Type::Empty) && mask_depth > 0 =>
+            {
+                if let Some(id) = mask_id_stack.last() {
+                    if !id.is_empty() {
+                        out.entry(id.clone())
+                            .or_default()
+                            .push(parse_svg_rect_geometry(attrs));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Figma「内描边」mask 在 Chromium / Skia 中的等价参数。
+///
+/// SVG 用 mask 把 `stroke-width` 裁成仅内侧一半；Chromium `.icon` 无 mask，改用
+/// `STROKE`（Skia 描边**居中**于路径）。为与 SVG 视觉一致且落在像素网格上清晰
+/// （半像素路径 + 整数线宽 → 锐利、不偏淡）：
+///
+/// - `stroke-width` 减半（例：2 → `STROKE, 1`）
+/// - 路径相对 SVG 矩形各边内缩 `stroke-width/4`（例：`(3,3,10,10)` →
+///   `(3.5,3.5,9,9)`，与 `browser_window_maximum.icon` 一致）
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InsideMaskStrokeAdjust {
+    stroke_width: f32,
+    /// 每边内缩量 = 原 `stroke-width / 4`，使居中描边对齐半像素网格。
+    inset: f32,
+}
+
+fn inside_mask_stroke_adjust_for_rect(
+    attributes: &std::collections::HashMap<String, Value>,
+    masks: &std::collections::HashMap<String, Vec<SvgMaskRect>>,
+) -> Option<InsideMaskStrokeAdjust> {
+    let mask_ref = attributes.get("mask")?;
+    let mask_id = parse_svg_url_ref(&mask_ref.to_string())?;
+    let mask_rects = masks.get(&mask_id)?;
+    let geom = parse_svg_rect_geometry(attributes);
+    let is_inside = mask_rects
+        .iter()
+        .copied()
+        .any(|m| svg_mask_rects_approx_equal(m, geom, 0.02));
+    if !is_inside {
+        return None;
+    }
+    let sw = parse_attr_f32(attributes, "stroke-width", 1.0);
+    Some(InsideMaskStrokeAdjust {
+        stroke_width: sw / 2.0,
+        inset: sw / 4.0,
+    })
+}
+
 /// 把 SVG `<rect>` 转换为 Chromium 命令。
 ///
 /// Chromium 的 `ROUND_RECT` 接受 `(x, y, w, h, r)` —— **只有一个圆角半径**。
@@ -733,23 +861,16 @@ fn handle_svg_rect(
     attributes: &std::collections::HashMap<String, Value>,
     write_new_path: bool,
     emit_path_colors: bool,
+    masks: &std::collections::HashMap<String, Vec<SvgMaskRect>>,
 ) -> String {
     let mut output = String::new();
 
-    let x = parse_attr_f32(attributes, "x", 0.0);
-    let y = parse_attr_f32(attributes, "y", 0.0);
-    let width = parse_attr_f32(attributes, "width", 0.0);
-    let height = parse_attr_f32(attributes, "height", 0.0);
-
-    // SVG 规则：rx / ry 互相回退（只指定一个时另一个等于它），均未指定时为 0。
-    let rx_attr = attributes.get("rx").and_then(parse_dim).map(|d| d as f32);
-    let ry_attr = attributes.get("ry").and_then(parse_dim).map(|d| d as f32);
-    let (rx, _ry) = match (rx_attr, ry_attr) {
-        (Some(a), Some(b)) => (a.min(b), a.min(b)),
-        (Some(a), None) => (a, a),
-        (None, Some(b)) => (b, b),
-        (None, None) => (0.0, 0.0),
-    };
+    let geom = parse_svg_rect_geometry(attributes);
+    let mut x = geom.x;
+    let mut y = geom.y;
+    let mut width = geom.w;
+    let mut height = geom.h;
+    let rx = geom.r;
 
     let transform = attributes
         .get("transform")
@@ -761,6 +882,23 @@ fn handle_svg_rect(
     // 内外边框消失），典型如「画中画」开关的双层矩形框图标。
     let stroked = svg_paint_fill_is_none_like(attributes.get("fill"))
         && svg_paint_stroke_is_usable(attributes.get("stroke"));
+
+    let inside_mask = if stroked {
+        inside_mask_stroke_adjust_for_rect(attributes, masks)
+    } else {
+        None
+    };
+
+    // 内描边 mask：路径内缩至半像素中心（如 3→3.5），配合减半线宽使 Skia 居中
+    // 描边与 SVG 内描边视觉一致且栅格清晰。
+    if inside_mask.is_some() && transform.is_none() {
+        if let Some(adj) = inside_mask {
+            x += adj.inset;
+            y += adj.inset;
+            width -= 2.0 * adj.inset;
+            height -= 2.0 * adj.inset;
+        }
+    }
 
     if write_new_path {
         output.push_str("NEW_PATH,\r\n");
@@ -782,7 +920,9 @@ fn handle_svg_rect(
     // 描边模式需在几何命令前声明（与 `handle_svg_path` 的开放折线分支一致）。
     if stroked {
         output.push_str("FILL_RULE_NONZERO,\r\n");
-        let sw = parse_attr_f32(attributes, "stroke-width", 1.0);
+        let sw = inside_mask
+            .map(|adj| adj.stroke_width)
+            .unwrap_or_else(|| parse_attr_f32(attributes, "stroke-width", 1.0));
         output.push_str(&format!("STROKE, {},\r\n", format_number(sw)));
     }
 
@@ -1047,53 +1187,12 @@ impl PenState {
     }
 }
 
-/// 把 SVG `<path>` 的 `d` 属性翻译为一段 Chromium 路径命令。
-fn handle_svg_path(
-    attributes: &std::collections::HashMap<String, Value>,
-    write_new_path: bool,
-    emit_path_colors: bool,
-) -> String {
-    let mut output = String::new();
-
-    if write_new_path {
-        output.push_str("NEW_PATH,\r\n");
-    }
-
-    if emit_path_colors {
-        if let Some(fill) = attributes.get("fill") {
-            let color = color_to_argb(&fill.to_string());
-            if !color.is_empty() {
-                output.push_str(&format!("PATH_COLOR_ARGB, {},\r\n", color));
-            }
-        }
-    }
-
-    // SVG 默认 fill-rule = nonzero；Chromium 默认 evenodd。
-    // 因此只在 SVG 是 nonzero（显式或缺省）时输出 FILL_RULE_NONZERO。
-    let fill_rule_str = attributes
-        .get("fill-rule")
-        .map(|v| v.to_string().trim().to_lowercase())
-        .unwrap_or_else(|| "nonzero".to_string());
-    if fill_rule_str == "nonzero" {
-        output.push_str("FILL_RULE_NONZERO,\r\n");
-    }
-
-    let data = match attributes.get("d") {
-        Some(d) => d,
-        None => return output,
-    };
-    let parsed = match Data::parse(&data.to_string()) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[chromium_icon] failed to parse path data: {}", e);
-            return output;
-        }
-    };
-
+/// 把已解析的 SVG path `d` 数据追加为 Chromium `MOVE_TO` / `LINE_TO` / … 命令。
+fn append_chromium_path_commands_from_data(data: &Data, output: &mut String) {
     let mut pen = PenState::default();
     let mut last_cubic_ctrl: Option<(f32, f32)> = None;
 
-    for command in parsed.iter() {
+    for command in data.iter() {
         match command {
             Command::Move(position, params) => {
                 // SVG 规则：M/m 后多余的坐标对按隐式 LineTo 处理。
@@ -1232,8 +1331,6 @@ fn handle_svg_path(
                 last_cubic_ctrl = None;
             }
             Command::SmoothQuadraticCurve(position, params) => {
-                // Chromium 命令名是 *_SHORTHAND，不是 SMOOTH_*。
-                // 同时 R_QUADRATIC_TO_SHORTHAND 是存在的。
                 let mut idx = 0;
                 while idx + 1 < params.len() {
                     let (x, y) = (params[idx], params[idx + 1]);
@@ -1295,7 +1392,6 @@ fn handle_svg_path(
                                 format_number(x),
                                 format_number(y),
                             ));
-                            // 记录“绝对坐标系下”的最后控制点，方便后续 S/s 反射。
                             last_cubic_ctrl = Some((pen.cur_x + x2, pen.cur_y + y2));
                             pen.line_rel(x, y);
                         }
@@ -1303,8 +1399,6 @@ fn handle_svg_path(
                 }
             }
             Command::SmoothCubicCurve(position, params) => {
-                // Chromium 只有 CUBIC_TO_SHORTHAND（绝对版），没有相对版本，
-                // 所以 `s` 必须就地展开为绝对坐标的 CUBIC_TO_SHORTHAND。
                 let mut idx = 0;
                 while idx + 3 < params.len() {
                     let (x2, y2, x, y) = (params[idx], params[idx + 1], params[idx + 2], params[idx + 3]);
@@ -1337,7 +1431,6 @@ fn handle_svg_path(
                         params[idx + 6],
                     );
                     idx += 7;
-                    // 标志位必须是整数 0/1。
                     let large_i = if large != 0.0 { 1 } else { 0 };
                     let sweep_i = if sweep != 0.0 { 1 } else { 0 };
                     match position {
@@ -1380,6 +1473,97 @@ fn handle_svg_path(
     }
 
     let _ = last_cubic_ctrl;
+}
+
+/// `fill="none"`、无 `Z`、且含曲线/弧的开放 `<path>`，用 `STROKE` + 原路径命令表达。
+///
+/// 纯折线仍走 [`try_emit_open_stroked_polyline_as_chromium_stroke_commands`]（末尾 `CLOSE`）。
+/// 若误把开放描边 path 当填充路径输出，Chromium 会隐式闭合子路径，右上角等位置
+/// 出现实心三角（典型：`icon-restore` 的后层窗口 L 形描边）。
+fn try_emit_open_stroked_path_with_curves_as_chromium_stroke_commands(
+    attributes: &std::collections::HashMap<String, Value>,
+    write_new_path: bool,
+    emit_path_colors: bool,
+) -> Option<String> {
+    if !svg_paint_fill_is_none_like(attributes.get("fill")) {
+        return None;
+    }
+    if !svg_paint_stroke_is_usable(attributes.get("stroke")) {
+        return None;
+    }
+    let d = attributes.get("d")?;
+    let parsed = Data::parse(&d.to_string()).ok()?;
+    if parsed.iter().any(|c| matches!(c, Command::Close)) {
+        return None;
+    }
+    // 纯 M/L/H/V 折线由专用分支处理（含末尾 CLOSE）。
+    if collect_open_polyline_contours_move_line_only(&parsed).is_some() {
+        return None;
+    }
+
+    let mut output = String::new();
+    if write_new_path {
+        output.push_str("NEW_PATH,\r\n");
+    }
+    if emit_path_colors {
+        if let Some(st) = attributes.get("stroke") {
+            let color = color_to_argb(&st.to_string());
+            if !color.is_empty() {
+                output.push_str(&format!("PATH_COLOR_ARGB, {},\r\n", color));
+            }
+        }
+    }
+    output.push_str("FILL_RULE_NONZERO,\r\n");
+    let sw = parse_attr_f32(attributes, "stroke-width", 1.0);
+    output.push_str(&format!("STROKE, {},\r\n", format_number(sw)));
+    append_chromium_path_commands_from_data(&parsed, &mut output);
+    Some(output)
+}
+
+/// 把 SVG `<path>` 的 `d` 属性翻译为一段 Chromium 路径命令。
+fn handle_svg_path(
+    attributes: &std::collections::HashMap<String, Value>,
+    write_new_path: bool,
+    emit_path_colors: bool,
+) -> String {
+    let mut output = String::new();
+
+    if write_new_path {
+        output.push_str("NEW_PATH,\r\n");
+    }
+
+    if emit_path_colors {
+        if let Some(fill) = attributes.get("fill") {
+            let color = color_to_argb(&fill.to_string());
+            if !color.is_empty() {
+                output.push_str(&format!("PATH_COLOR_ARGB, {},\r\n", color));
+            }
+        }
+    }
+
+    // SVG 默认 fill-rule = nonzero；Chromium 默认 evenodd。
+    // 因此只在 SVG 是 nonzero（显式或缺省）时输出 FILL_RULE_NONZERO。
+    let fill_rule_str = attributes
+        .get("fill-rule")
+        .map(|v| v.to_string().trim().to_lowercase())
+        .unwrap_or_else(|| "nonzero".to_string());
+    if fill_rule_str == "nonzero" {
+        output.push_str("FILL_RULE_NONZERO,\r\n");
+    }
+
+    let data = match attributes.get("d") {
+        Some(d) => d,
+        None => return output,
+    };
+    let parsed = match Data::parse(&data.to_string()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[chromium_icon] failed to parse path data: {}", e);
+            return output;
+        }
+    };
+
+    append_chromium_path_commands_from_data(&parsed, &mut output);
     output
 }
 
@@ -1539,6 +1723,8 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
     // 在生成 .icon 时会全部丢失颜色。
     let stylesheet = collect_svg_stylesheet(&events);
 
+    let svg_masks = collect_svg_mask_rects(&events);
+
     let svg_root_fill: Option<String> = events.iter().find_map(|ev| {
         if let Event::Tag(name, t, attrs) = ev {
             if name.eq_ignore_ascii_case("svg") && matches!(t, Type::Start | Type::Empty) {
@@ -1581,6 +1767,18 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
                         emitted_path = true;
                         continue;
                     }
+                    if let Some(chunk) =
+                        try_emit_open_stroked_path_with_curves_as_chromium_stroke_commands(
+                            &resolved,
+                            emitted_path,
+                            emit_path_colors,
+                        )
+                    {
+                        write!(output_file, "{}", chunk)
+                            .map_err(|e| format!("Failed to write path: {}", e))?;
+                        emitted_path = true;
+                        continue;
+                    }
                 }
 
                 if !open_polyline_glyph {
@@ -1604,7 +1802,7 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
             }
             Event::Tag("rect", t, attributes) if is_open_tag(t) && non_paint_depth == 0 => {
                 let resolved = resolve_svg_styles(&stylesheet, attributes, "rect");
-                let data = handle_svg_rect(t, &resolved, emitted_path, emit_path_colors);
+                let data = handle_svg_rect(t, &resolved, emitted_path, emit_path_colors, &svg_masks);
                 if !data.is_empty() {
                     write!(output_file, "{}", data)
                         .map_err(|e| format!("Failed to write rect: {}", e))?;
@@ -2505,6 +2703,107 @@ MOVE_TO, 0, 0,\nLINE_TO, 16, 0,\nLINE_TO, 16, 16,\nLINE_TO, 0, 16,\nCLOSE,\n";
             svg_back.contains("stroke-width"),
             "reverse preview lost stroke outline:\n{}",
             svg_back
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 还原窗口图标：后层 L 形描边含圆角 cubic，必须是 `STROKE` 开放路径，不能当填充
+    /// （否则隐式闭合会在右上角出现实心三角）。
+    #[test]
+    fn restore_icon_open_stroked_path_with_cubic_emits_stroke_not_fill() {
+        use std::io::Write;
+        let dir =
+            std::env::temp_dir().join(format!("chromium_icon_restore_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg_path = dir.join("icon-restore.svg");
+
+        let svg = r##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect x="2.5" y="4.5" width="9" height="9" rx="0.5" stroke="#1F2530"/>
+<path d="M6 2.5H12.5C13.0523 2.5 13.5 2.94772 13.5 3.5V10" stroke="#1F2530"/>
+</svg>
+"##;
+        let mut f = std::fs::File::create(&svg_path).unwrap();
+        f.write_all(svg.as_bytes()).unwrap();
+        drop(f);
+
+        let icon_path =
+            try_convert_svg_to_chromium_icon(svg_path.to_str().unwrap(), "icon-restore.icon")
+                .expect("svg -> icon should succeed");
+        let icon_text = std::fs::read_to_string(&icon_path).unwrap();
+        assert!(
+            icon_text.contains("STROKE, 1,\r\n"),
+            "back window L-stroke must use STROKE:\n{}",
+            icon_text
+        );
+        assert!(
+            icon_text.contains("CUBIC_TO,"),
+            "rounded corner cubic must be preserved:\n{}",
+            icon_text
+        );
+        assert!(
+            !icon_text.contains("CLOSE,"),
+            "open L-stroke must not be closed (would fill a triangle):\n{}",
+            icon_text
+        );
+
+        let svg_back = try_convert_chromium_icon_path_to_svg_markup(&icon_path)
+            .expect("icon -> svg should succeed");
+        assert!(
+            svg_back.contains("stroke=") && svg_back.contains("fill=\"none\""),
+            "reverse preview should render stroked open path:\n{}",
+            svg_back
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Figma 内描边 mask：`STROKE` 减半 + 路径内缩至半像素（3,3,10,10 → 3.5,3.5,9,9），
+    /// 对齐 `browser_window_maximum.icon`。
+    #[test]
+    fn figma_inside_stroke_mask_halves_stroke_width() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "chromium_icon_inside_mask_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg_path = dir.join("icon-max.svg");
+
+        let svg = r##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<mask id="path-1-inside-1_6247_21705" fill="white">
+<rect x="3" y="3" width="10" height="10" rx="0.875"/>
+</mask>
+<rect x="3" y="3" width="10" height="10" rx="0.875" stroke="#1F2530" stroke-width="2" mask="url(#path-1-inside-1_6247_21705)"/>
+</svg>
+"##;
+        let mut f = std::fs::File::create(&svg_path).unwrap();
+        f.write_all(svg.as_bytes()).unwrap();
+        drop(f);
+
+        let icon_path =
+            try_convert_svg_to_chromium_icon(svg_path.to_str().unwrap(), "icon-max.icon")
+                .expect("svg -> icon should succeed");
+        let icon_text = std::fs::read_to_string(&icon_path).unwrap();
+        assert!(
+            icon_text.contains("STROKE, 1,\r\n"),
+            "inside-stroke mask must halve stroke-width 2 -> 1, got:\n{}",
+            icon_text
+        );
+        assert!(
+            !icon_text.contains("STROKE, 2,"),
+            "must not keep full stroke-width 2 without mask:\n{}",
+            icon_text
+        );
+        assert!(
+            icon_text.contains("ROUND_RECT, 3.5, 3.5, 9, 9, 0.88,"),
+            "inside-stroke must inset geometry to match Chromium browser_window_maximum:\n{}",
+            icon_text
+        );
+        assert!(
+            !icon_text.contains("ROUND_RECT, 3, 3, 10, 10,"),
+            "must not use un-inset SVG rect geometry:\n{}",
+            icon_text
         );
 
         let _ = std::fs::remove_dir_all(&dir);
