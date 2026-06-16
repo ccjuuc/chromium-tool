@@ -390,6 +390,111 @@ fn svg_paint_stroke_is_usable(v: Option<&Value>) -> bool {
     .unwrap_or(false)
 }
 
+/// `fill="url(#…)"` / `stroke="url(#…)"` 等 SVG paint server，Chromium `.icon` 无法表达。
+fn svg_paint_value_is_url_reference(v: Option<&Value>) -> bool {
+    v.map(|x| {
+        let t = x.to_string().trim().to_ascii_lowercase();
+        t.starts_with("url(")
+    })
+    .unwrap_or(false)
+}
+
+fn svg_attr_href_value(attributes: &std::collections::HashMap<String, Value>) -> Option<String> {
+    attributes.iter().find_map(|(k, v)| {
+        if k.eq_ignore_ascii_case("href") || k.ends_with(":href") {
+            Some(v.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn svg_href_points_to_raster_image(href: &str) -> bool {
+    let s = href.trim().to_ascii_lowercase();
+    s.starts_with("data:image/")
+        || s.starts_with("http://")
+        || s.starts_with("https://")
+        || s.starts_with("file:")
+        || s.ends_with(".png")
+        || s.ends_with(".jpg")
+        || s.ends_with(".jpeg")
+        || s.ends_with(".webp")
+        || s.ends_with(".gif")
+        || s.ends_with(".bmp")
+}
+
+/// 转换前校验：拒绝位图头像/照片、pattern 平铺、渐变等无法矢量化的 SVG。
+fn validate_svg_vector_convertible(events: &[Event]) -> Result<(), String> {
+    let is_open_tag = |t: &Type| matches!(t, Type::Start | Type::Empty);
+    let mut has_raster_image = false;
+    let mut has_pattern = false;
+    let mut has_gradient = false;
+    let mut visible_paint_server_fill = false;
+
+    let mut non_paint_depth: usize = 0;
+    for event in events {
+        match event {
+            Event::Tag(name, t, _) if is_svg_non_paint_subtree(name) => {
+                if matches!(t, Type::Start | Type::Empty) {
+                    if name.eq_ignore_ascii_case("pattern") {
+                        has_pattern = true;
+                    }
+                    if name.eq_ignore_ascii_case("linearGradient")
+                        || name.eq_ignore_ascii_case("radialGradient")
+                    {
+                        has_gradient = true;
+                    }
+                    non_paint_depth += 1;
+                } else if matches!(t, Type::End) {
+                    non_paint_depth = non_paint_depth.saturating_sub(1);
+                }
+            }
+            Event::Tag(name, t, attrs) if is_open_tag(t) => {
+                if name.eq_ignore_ascii_case("image") {
+                    if svg_attr_href_value(attrs)
+                        .is_some_and(|h| svg_href_points_to_raster_image(&h))
+                    {
+                        has_raster_image = true;
+                    }
+                }
+                if non_paint_depth == 0
+                    && matches!(name.as_ref(), "path" | "rect" | "circle" | "ellipse")
+                {
+                    if svg_paint_value_is_url_reference(attrs.get("fill"))
+                        || svg_paint_value_is_url_reference(attrs.get("stroke"))
+                    {
+                        visible_paint_server_fill = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if has_raster_image {
+        return Err(
+            "SVG 含有嵌入式位图（<image> / PNG·JPEG 等）。Chromium .icon 仅支持矢量路径，\
+             头像/照片类资源无法直接转换；请使用纯矢量 SVG，或保留为 PNG/ICO 等位图格式。"
+                .to_string(),
+        );
+    }
+    if has_pattern && visible_paint_server_fill {
+        return Err(
+            "SVG 使用 pattern 平铺填充（如 Figma 导出的头像底图）。Chromium .icon 不支持 pattern，\
+             无法保留位图内容；请改用纯色/描边的矢量图形。"
+                .to_string(),
+        );
+    }
+    if has_gradient && visible_paint_server_fill {
+        return Err(
+            "SVG 使用渐变填充（linearGradient/radialGradient）。Chromium .icon 不支持渐变，\
+             请改为纯色或描边矢量。"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn svg_path_data_has_close_command(d: Option<&Value>) -> bool {
     let Some(v) = d else {
         return false;
@@ -882,6 +987,14 @@ fn handle_svg_rect(
     // 内外边框消失），典型如「画中画」开关的双层矩形框图标。
     let stroked = svg_paint_fill_is_none_like(attributes.get("fill"))
         && svg_paint_stroke_is_usable(attributes.get("stroke"));
+
+    // pattern / 渐变等 paint server 填充无法写入 .icon；跳过以免生成无色的实心占位形（预览呈黑块/黑圆）。
+    if !stroked
+        && (svg_paint_value_is_url_reference(attributes.get("fill"))
+            || svg_paint_value_is_url_reference(attributes.get("stroke")))
+    {
+        return String::new();
+    }
 
     let inside_mask = if stroked {
         inside_mask_stroke_adjust_for_rect(attributes, masks)
@@ -1475,12 +1588,12 @@ fn append_chromium_path_commands_from_data(data: &Data, output: &mut String) {
     let _ = last_cubic_ctrl;
 }
 
-/// `fill="none"`、无 `Z`、且含曲线/弧的开放 `<path>`，用 `STROKE` + 原路径命令表达。
+/// `fill="none"` 且带 `stroke` 的 `<path>`，用 Chromium 原生 `STROKE` 表达描边。
+/// 支持开放折线、含曲线/弧的开放或闭合子路径（如空心五角星 `…Z`）。
 ///
-/// 纯折线仍走 [`try_emit_open_stroked_polyline_as_chromium_stroke_commands`]（末尾 `CLOSE`）。
-/// 若误把开放描边 path 当填充路径输出，Chromium 会隐式闭合子路径，右上角等位置
-/// 出现实心三角（典型：`icon-restore` 的后层窗口 L 形描边）。
-fn try_emit_open_stroked_path_with_curves_as_chromium_stroke_commands(
+/// 纯 M/L/H/V 开放折线仍走 [`try_emit_open_stroked_polyline_as_chromium_stroke_commands`]（末尾 `CLOSE`）。
+/// 若误把仅描边 path 当填充路径输出，Chromium 会隐式闭合子路径并填充，空心图标会变成实心块。
+fn try_emit_stroked_path_as_chromium_stroke_commands(
     attributes: &std::collections::HashMap<String, Value>,
     write_new_path: bool,
     emit_path_colors: bool,
@@ -1493,11 +1606,10 @@ fn try_emit_open_stroked_path_with_curves_as_chromium_stroke_commands(
     }
     let d = attributes.get("d")?;
     let parsed = Data::parse(&d.to_string()).ok()?;
-    if parsed.iter().any(|c| matches!(c, Command::Close)) {
-        return None;
-    }
-    // 纯 M/L/H/V 折线由专用分支处理（含末尾 CLOSE）。
-    if collect_open_polyline_contours_move_line_only(&parsed).is_some() {
+    // 纯 M/L/H/V 开放折线由专用分支处理（含末尾 CLOSE）。
+    if collect_open_polyline_contours_move_line_only(&parsed).is_some()
+        && !parsed.iter().any(|c| matches!(c, Command::Close))
+    {
         return None;
     }
 
@@ -1620,6 +1732,12 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
 ) -> Result<String, String> {
     let emit_path_colors = options.emit_path_colors;
     let mut content = String::new();
+    let events = svg::open(svg_path, &mut content)
+        .map_err(|e| format!("Failed to open/parse SVG '{}': {}", svg_path, e))?
+        .collect::<Vec<_>>();
+
+    validate_svg_vector_convertible(&events)?;
+
     let parent = Path::new(svg_path).parent().unwrap_or_else(|| Path::new("."));
     let dst = PathBuf::from(parent).join(output_path);
     let mut output_file = File::create(dst.clone()).map_err(|e| {
@@ -1640,10 +1758,6 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
     writeln!(output_file, "// found in the LICENSE file.")
         .map_err(|e| format!("Failed to write header: {}", e))?;
     writeln!(output_file).map_err(|e| format!("Failed to write header: {}", e))?;
-
-    let events = svg::open(svg_path, &mut content)
-        .map_err(|e| format!("Failed to open/parse SVG '{}': {}", svg_path, e))?
-        .collect::<Vec<_>>();
 
     // 第 1 轮：从 `<svg>` 标签上读取画布尺寸（优先 viewBox，其次 width）。
     // 仅认 Start / Empty 形式的开标签，跳过 End（其 attributes 为空）。
@@ -1753,11 +1867,28 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
             }
             Event::Tag("path", t, attributes) if is_open_tag(t) && non_paint_depth == 0 => {
                 let mut resolved = resolve_svg_styles(&stylesheet, attributes, "path");
-                let open_polyline_glyph = svg_paint_fill_is_none_like(resolved.get("fill"))
-                    && !svg_path_data_has_close_command(resolved.get("d"));
+                let stroke_only_glyph = svg_paint_fill_is_none_like(resolved.get("fill"))
+                    && svg_paint_stroke_is_usable(resolved.get("stroke"));
 
-                if open_polyline_glyph && svg_paint_stroke_is_usable(resolved.get("stroke")) {
-                    if let Some(chunk) = try_emit_open_stroked_polyline_as_chromium_stroke_commands(
+                if stroke_only_glyph {
+                    let open_polyline_glyph =
+                        !svg_path_data_has_close_command(resolved.get("d"));
+
+                    if open_polyline_glyph {
+                        if let Some(chunk) =
+                            try_emit_open_stroked_polyline_as_chromium_stroke_commands(
+                                &resolved,
+                                emitted_path,
+                                emit_path_colors,
+                            )
+                        {
+                            write!(output_file, "{}", chunk)
+                                .map_err(|e| format!("Failed to write path: {}", e))?;
+                            emitted_path = true;
+                            continue;
+                        }
+                    }
+                    if let Some(chunk) = try_emit_stroked_path_as_chromium_stroke_commands(
                         &resolved,
                         emitted_path,
                         emit_path_colors,
@@ -1767,23 +1898,14 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
                         emitted_path = true;
                         continue;
                     }
-                    if let Some(chunk) =
-                        try_emit_open_stroked_path_with_curves_as_chromium_stroke_commands(
-                            &resolved,
-                            emitted_path,
-                            emit_path_colors,
-                        )
-                    {
-                        write!(output_file, "{}", chunk)
-                            .map_err(|e| format!("Failed to write path: {}", e))?;
-                        emitted_path = true;
-                        continue;
-                    }
+                    eprintln!(
+                        "[chromium_icon] warning: stroke-only <path> could not be converted to \
+                         STROKE commands; skipping to avoid solid-fill artifact"
+                    );
+                    continue;
                 }
 
-                if !open_polyline_glyph {
-                    ensure_fill_for_chromium_vector_paint(&mut resolved, svg_root_fill.as_deref());
-                }
+                ensure_fill_for_chromium_vector_paint(&mut resolved, svg_root_fill.as_deref());
                 let data = handle_svg_path(&resolved, emitted_path, emit_path_colors);
                 if !data.is_empty() {
                     write!(output_file, "{}", data)
@@ -1820,6 +1942,14 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
             }
             _ => {}
         }
+    }
+
+    if !emitted_path {
+        return Err(
+            "SVG 中没有可转换为 Chromium .icon 的矢量图元（可能使用了位图/pattern/渐变填充）。\
+             仅支持纯色填充或描边的 path/rect/circle 等矢量形状。"
+                .to_string(),
+        );
     }
 
     Ok(dst.to_string_lossy().into_owned())
@@ -2708,6 +2838,48 @@ MOVE_TO, 0, 0,\nLINE_TO, 16, 0,\nLINE_TO, 16, 16,\nLINE_TO, 0, 16,\nCLOSE,\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 书签空心星（闭合 path + 仅 stroke）须走 `STROKE`，不能当填充路径（会变成实心星）。
+    #[test]
+    fn stroke_only_closed_star_emits_stroke_not_solid_fill() {
+        let dir = std::env::temp_dir().join(format!(
+            "chromium_icon_bookmark_star_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg_path = dir.join("ic_bookmarks_default.svg");
+        let svg = br##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M7.54996 0.929695C7.73206 0.553502 8.26794 0.553503 8.45004 0.929696L10.4227 5.00478L14.9487 5.59289C15.3679 5.64735 15.5346 6.16502 15.2259 6.45381L11.92 9.54733L12.7517 13.9747C12.8292 14.3872 12.3945 14.7059 12.0244 14.5079L8 12.3548L3.97561 14.5079C3.60548 14.7059 3.17084 14.3872 3.24833 13.9747L4.08 9.54733L0.774057 6.45381C0.465439 6.16502 0.63212 5.64735 1.05126 5.59289L5.57731 5.00478L7.54996 0.929695Z" stroke="#1F2530"/>
+</svg>"##;
+        std::fs::write(&svg_path, svg).unwrap();
+        let icon_path = try_convert_svg_to_chromium_icon(
+            svg_path.to_str().unwrap(),
+            "ic_bookmarks_default.icon",
+        )
+        .unwrap();
+        let txt = std::fs::read_to_string(&icon_path).unwrap();
+        assert!(
+            txt.contains("STROKE,"),
+            "hollow star must use STROKE, not fill:\n{}",
+            txt
+        );
+        assert!(
+            txt.contains("PATH_COLOR_ARGB, 0xFF, 0x1F, 0x25, 0x30,"),
+            "stroke color must be emitted:\n{}",
+            txt
+        );
+        assert!(
+            txt.contains("CLOSE,"),
+            "closed star path must retain CLOSE:\n{}",
+            txt
+        );
+        assert!(
+            !txt.contains("CUBIC_TO,") || txt.contains("STROKE,"),
+            "unexpected solid-fill path without STROKE:\n{}",
+            txt
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 还原窗口图标：后层 L 形描边含圆角 cubic，必须是 `STROKE` 开放路径，不能当填充
     /// （否则隐式闭合会在右上角出现实心三角）。
     #[test]
@@ -2755,6 +2927,32 @@ MOVE_TO, 0, 0,\nLINE_TO, 16, 0,\nLINE_TO, 16, 16,\nLINE_TO, 0, 16,\nCLOSE,\n";
             svg_back
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 嵌入式 PNG 头像（pattern + <image>）不能转为矢量 .icon，应明确报错而非黑圆占位。
+    #[test]
+    fn svg_embedded_png_avatar_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("avart_reject_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg_path = dir.join("avatar.svg");
+        let svg = br##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect width="16" height="16" rx="8" fill="url(#pattern0)"/>
+<defs>
+<pattern id="pattern0" patternContentUnits="objectBoundingBox" width="1" height="1">
+<use href="#image0"/>
+</pattern>
+<image id="image0" width="4" height="4" href="data:image/png;base64,AAAA"/>
+</defs>
+</svg>"##;
+        std::fs::write(&svg_path, svg).unwrap();
+        let err =
+            try_convert_svg_to_chromium_icon(svg_path.to_str().unwrap(), "avatar.icon").unwrap_err();
+        assert!(
+            err.contains("位图") || err.contains("PNG"),
+            "expected raster rejection, got: {}",
+            err
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
