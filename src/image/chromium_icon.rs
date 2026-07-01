@@ -390,6 +390,48 @@ fn svg_paint_stroke_is_usable(v: Option<&Value>) -> bool {
     .unwrap_or(false)
 }
 
+/// 统计 SVG path `d` 中闭合子路径数量（`Z`/`z` 个数）。
+fn count_closed_subpaths_in_svg_data(data: &Data) -> usize {
+    data.iter()
+        .filter(|cmd| matches!(cmd, Command::Close))
+        .count()
+}
+
+/// 决定是否向 `.icon` 写入 `FILL_RULE_NONZERO`。
+///
+/// Chromium 绘制时 **默认 EvenOdd**（见 `ui/gfx/paint_vector_icon.cc` 里 `start_new_path`
+/// 的 `SkPathFillType::kEvenOdd`）；`.icon` 里 **没有** `FILL_RULE_EVENODD` 命令，省略
+/// `FILL_RULE_NONZERO` 即表示 evenodd。
+///
+/// SVG 规范缺省 fill-rule 为 nonzero，但 Figma/Sketch 导出的镂空 compound path 常漏写
+/// `fill-rule="evenodd"`。此时若仍写 `FILL_RULE_NONZERO` 会把洞填实（全黑）。
+fn append_chromium_fill_rule_for_filled_path(
+    attributes: &std::collections::HashMap<String, Value>,
+    path_data: &Data,
+    output: &mut String,
+) {
+    let explicit = attributes
+        .get("fill-rule")
+        .map(|v| v.to_string().trim().to_ascii_lowercase());
+
+    let use_nonzero = match explicit.as_deref() {
+        Some("evenodd") => false,
+        Some("nonzero") => true,
+        Some(other) => {
+            eprintln!(
+                "[chromium_icon] warning: unknown fill-rule '{}', treating as nonzero",
+                other
+            );
+            true
+        }
+        None => count_closed_subpaths_in_svg_data(path_data) <= 1,
+    };
+
+    if use_nonzero {
+        output.push_str("FILL_RULE_NONZERO,\r\n");
+    }
+}
+
 /// `fill="url(#…)"` / `stroke="url(#…)"` 等 SVG paint server，Chromium `.icon` 无法表达。
 fn svg_paint_value_is_url_reference(v: Option<&Value>) -> bool {
     v.map(|x| {
@@ -1653,16 +1695,6 @@ fn handle_svg_path(
         }
     }
 
-    // SVG 默认 fill-rule = nonzero；Chromium 默认 evenodd。
-    // 因此只在 SVG 是 nonzero（显式或缺省）时输出 FILL_RULE_NONZERO。
-    let fill_rule_str = attributes
-        .get("fill-rule")
-        .map(|v| v.to_string().trim().to_lowercase())
-        .unwrap_or_else(|| "nonzero".to_string());
-    if fill_rule_str == "nonzero" {
-        output.push_str("FILL_RULE_NONZERO,\r\n");
-    }
-
     let data = match attributes.get("d") {
         Some(d) => d,
         None => return output,
@@ -1675,6 +1707,7 @@ fn handle_svg_path(
         }
     };
 
+    append_chromium_fill_rule_for_filled_path(attributes, &parsed, &mut output);
     append_chromium_path_commands_from_data(&parsed, &mut output);
     output
 }
@@ -3299,6 +3332,85 @@ MOVE_TO, 0, 0,\nLINE_TO, 16, 0,\nLINE_TO, 16, 16,\nLINE_TO, 0, 16,\nCLOSE,\n";
             "stroked vector path must not use fill-only paint in preview: {}",
             svg
         );
+    }
+
+    /// 多子路径镂空 SVG 未写 fill-rule 时，应依赖 Chromium 默认 evenodd（不写 NONZERO）。
+    #[test]
+    fn compound_path_without_fill_rule_omits_fill_rule_nonzero() {
+        let dir = std::env::temp_dir().join(format!(
+            "chromium_icon_evenodd_heuristic_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg_path = dir.join("split_pin.svg");
+        let svg = br##"<?xml version="1.0"?>
+<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M9 2H14L14.1025 2.00488C14.6067 2.05621 15 2.48232 15 3V13C15 13.5177 14.6067 13.9438 14.1025 13.9951L14 14H9V17H8V0H9V2ZM7 3H2V13H7V14H2C1.48232 14 1.05621 13.6067 1.00488 13.1025L1 13V3C1 2.44772 1.44772 2 2 2H7V3ZM9 13H14V3H9V13Z" fill="#1F2530"/>
+</svg>"##;
+        std::fs::write(&svg_path, svg).unwrap();
+        let icon_path =
+            try_convert_svg_to_chromium_icon(svg_path.to_str().unwrap(), "split_pin.icon")
+                .unwrap();
+        let txt = std::fs::read_to_string(&icon_path).unwrap();
+        assert!(
+            !txt.contains("FILL_RULE_NONZERO"),
+            "multi-subpath hole icon must use Chromium default evenodd:\n{}",
+            txt
+        );
+        assert!(
+            txt.matches("CLOSE,").count() >= 3,
+            "expected compound path closes:\n{}",
+            txt
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_evenodd_omits_fill_rule_nonzero() {
+        let dir = std::env::temp_dir().join(format!(
+            "chromium_icon_explicit_evenodd_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg_path = dir.join("evenodd.svg");
+        let svg = br##"<?xml version="1.0"?>
+<svg width="16" height="16" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+<path fill-rule="evenodd" fill="#000" d="M2 2 H14 V14 H2 Z M4 4 H12 V12 H4 Z"/>
+</svg>"##;
+        std::fs::write(&svg_path, svg).unwrap();
+        let icon_path =
+            try_convert_svg_to_chromium_icon(svg_path.to_str().unwrap(), "evenodd.icon").unwrap();
+        let txt = std::fs::read_to_string(&icon_path).unwrap();
+        assert!(
+            !txt.contains("FILL_RULE_NONZERO"),
+            "explicit evenodd must omit NONZERO:\n{}",
+            txt
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_subpath_without_fill_rule_keeps_nonzero() {
+        let dir = std::env::temp_dir().join(format!(
+            "chromium_icon_single_nonzero_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg_path = dir.join("single.svg");
+        let svg = br##"<?xml version="1.0"?>
+<svg width="16" height="16" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+<path fill="#000" d="M2 2 H14 V14 H2 Z"/>
+</svg>"##;
+        std::fs::write(&svg_path, svg).unwrap();
+        let icon_path =
+            try_convert_svg_to_chromium_icon(svg_path.to_str().unwrap(), "single.icon").unwrap();
+        let txt = std::fs::read_to_string(&icon_path).unwrap();
+        assert!(
+            txt.contains("FILL_RULE_NONZERO"),
+            "single closed path should keep SVG-default nonzero:\n{}",
+            txt
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
