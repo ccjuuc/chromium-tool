@@ -77,6 +77,18 @@ fn resolve_icon_preview_directory(root_param: Option<&str>) -> Result<PathBuf, S
     }
 }
 
+/// 将 Windows `canonicalize` 产生的 verbatim 路径转换为适合界面展示和再次输入的常规路径。
+fn display_icon_preview_directory(path: &std::path::Path) -> String {
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        value.into_owned()
+    }
+}
+
 /// 把上传文件名转成 `<stem>-ori<ext>`，与转换输出名隔离，避免互相覆盖。
 ///
 /// - `foo.svg`        → `foo-ori.svg`
@@ -208,6 +220,54 @@ pub async fn icon_batch_preview_page() -> impl IntoResponse {
     Html(include_str!("../../templates/icon_batch_preview.html").to_string())
 }
 
+#[derive(Deserialize, Default)]
+pub struct IconPreviewSelectDirectoryRequest {
+    #[serde(default)]
+    initial_directory: Option<String>,
+}
+
+#[derive(Serialize)]
+struct IconPreviewSelectDirectoryResponse {
+    directory: Option<String>,
+}
+
+/// 打开系统原生目录选择器。此工具作为本机服务运行，所选绝对路径可直接供预览与转换接口使用。
+pub async fn select_icon_preview_directory(
+    Json(body): Json<IconPreviewSelectDirectoryRequest>,
+) -> impl IntoResponse {
+    let initial = body
+        .initial_directory
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let selected = match tokio::task::spawn_blocking(move || {
+        let mut dialog = rfd::FileDialog::new().set_title("选择 .icon 工作目录");
+        if let Some(path) = initial {
+            if std::path::Path::new(&path).is_dir() {
+                dialog = dialog.set_directory(path);
+            }
+        }
+        dialog.pick_folder()
+    })
+    .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("目录选择器启动失败: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    Json(IconPreviewSelectDirectoryResponse {
+        directory: selected
+            .as_deref()
+            .map(display_icon_preview_directory),
+    })
+    .into_response()
+}
+
 #[derive(Serialize)]
 struct IconPreviewList {
     icons: Vec<String>,
@@ -222,7 +282,7 @@ pub async fn list_icon_preview_files(Query(q): Query<IconPreviewRootQuery>) -> i
         Ok(p) => p,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
-    let dir_display = work_dir.to_string_lossy().to_string();
+    let dir_display = display_icon_preview_directory(&work_dir);
     let mut icons: Vec<String> = Vec::new();
     let read_dir = match std::fs::read_dir(&work_dir) {
         Ok(r) => r,
@@ -303,7 +363,7 @@ pub async fn icon_preview_batch_convert(
         Ok(p) => p,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
-    let dir_str = root.to_string_lossy().to_string();
+    let dir_str = display_icon_preview_directory(&root);
 
     let read_dir = match std::fs::read_dir(&root) {
         Ok(r) => r,

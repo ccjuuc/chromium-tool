@@ -1118,6 +1118,30 @@ fn handle_svg_rect(
     output
 }
 
+/// Figma 等工具导出的 SVG 有时会在图标前放一个整画布白色 `<rect>` 作为预览背景。
+/// Chromium 模板图标关闭 PATH_COLOR 后会把它也染成运行时颜色，最终覆盖成整块色块。
+fn is_full_canvas_white_background_rect(
+    attributes: &std::collections::HashMap<String, Value>,
+    canvas_dimensions: f64,
+) -> bool {
+    if svg_paint_stroke_is_usable(attributes.get("stroke")) {
+        return false;
+    }
+    let fill = match attributes.get("fill") {
+        Some(fill) => color_to_argb(&fill.to_string()),
+        None => return false,
+    };
+    if fill != "0xFF, 0xFF, 0xFF, 0xFF" {
+        return false;
+    }
+    let geom = parse_svg_rect_geometry(attributes);
+    let epsilon = 0.01_f32;
+    geom.x.abs() <= epsilon
+        && geom.y.abs() <= epsilon
+        && (geom.w - canvas_dimensions as f32).abs() <= epsilon
+        && (geom.h - canvas_dimensions as f32).abs() <= epsilon
+}
+
 /// 输出实心圆盘（`CIRCLE` + 可选 `PATH_COLOR_ARGB`）。
 fn emit_chromium_filled_circle(
     cx: f32,
@@ -1957,6 +1981,9 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
             }
             Event::Tag("rect", t, attributes) if is_open_tag(t) && non_paint_depth == 0 => {
                 let resolved = resolve_svg_styles(&stylesheet, attributes, "rect");
+                if is_full_canvas_white_background_rect(&resolved, canvas_dimensions) {
+                    continue;
+                }
                 let data = handle_svg_rect(t, &resolved, emitted_path, emit_path_colors, &svg_masks);
                 if !data.is_empty() {
                     write!(output_file, "{}", data)
@@ -3410,6 +3437,37 @@ MOVE_TO, 0, 0,\nLINE_TO, 16, 0,\nLINE_TO, 16, 16,\nLINE_TO, 0, 16,\nCLOSE,\n";
             "single closed path should keep SVG-default nonzero:\n{}",
             txt
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_canvas_white_export_background_is_not_emitted() {
+        let dir = std::env::temp_dir().join(format!(
+            "chromium_icon_white_canvas_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg_path = dir.join("cloud.svg");
+        let svg = br##"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect width="16" height="16" fill="white"/>
+<path d="M2 8 H14 V13 H2 Z" fill="#1F2530"/>
+</svg>"##;
+        std::fs::write(&svg_path, svg).unwrap();
+        let icon_path = try_convert_svg_to_chromium_icon_with_options(
+            svg_path.to_str().unwrap(),
+            "cloud.icon",
+            &SvgToChromiumIconOptions {
+                emit_path_colors: false,
+            },
+        )
+        .unwrap();
+        let txt = std::fs::read_to_string(&icon_path).unwrap();
+        assert!(
+            !txt.contains("ROUND_RECT, 0, 0, 16, 16, 0,"),
+            "full-canvas white export background must be skipped:\n{}",
+            txt
+        );
+        assert!(txt.contains("MOVE_TO, 2, 8,"), "glyph path missing:\n{}", txt);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

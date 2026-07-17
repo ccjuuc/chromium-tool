@@ -26,6 +26,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/icon_preview_list", get(handlers::oem::list_icon_preview_files))
         .route(
+            "/icon_preview_select_directory",
+            post(handlers::oem::select_icon_preview_directory),
+        )
+        .route(
             "/icon_preview_batch_convert",
             post(handlers::oem::icon_preview_batch_convert),
         )
@@ -64,4 +68,3 @@ pub fn create_router(state: AppState) -> Router {
         .layer(cors)
         .with_state(state)
 }
-

@@ -38,12 +38,13 @@
             color: #555;
             margin-bottom: 6px;
         }
-        .toolbar-field input[type="number"] {
+        .toolbar-field select {
             width: 100px;
             padding: 10px 12px;
             border: 2px solid #e0e0e0;
             border-radius: 8px;
             font-size: 1rem;
+            background: #fff;
         }
         .toolbar-field input[type="text"] {
             min-width: 260px;
@@ -54,6 +55,9 @@
             font-size: .92rem;
             font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
         }
+        .directory-row { display: flex; gap: 10px; align-items: stretch; }
+        .directory-row input { min-width: 0 !important; width: 100%; }
+        .directory-row .btn { flex: 0 0 auto; }
         .toolbar-field input:focus { outline: none; border-color: #667eea; }
         .toolbar-field-grow { flex: 1 1 100%; max-width: 100%; }
         .btn {
@@ -149,11 +153,21 @@
         <div class="toolbar">
             <div class="toolbar-field toolbar-field-grow">
                 <label for="scanRoot">工作目录</label>
-                <input type="text" id="scanRoot" placeholder="例：H:\project\icons（批量转换必填；将把其中全部 *.svg 生成同路径下的 .icon）" autocomplete="off" spellcheck="false">
+                <div class="directory-row">
+                    <input type="text" id="scanRoot" list="scanRootHistory" placeholder="例：H:\project\icons（可输入、选择历史或浏览）" autocomplete="off" spellcheck="false">
+                    <datalist id="scanRootHistory"></datalist>
+                    <button type="button" class="btn" id="selectDirectoryBtn">选择目录…</button>
+                </div>
             </div>
             <div class="toolbar-field">
                 <label for="previewSize">预览边长 (px)</label>
-                <input type="number" id="previewSize" min="16" max="512" value="64" step="1">
+                <select id="previewSize">
+                    <option value="16">16</option>
+                    <option value="32">32</option>
+                    <option value="48">48</option>
+                    <option value="64" selected>64</option>
+                    <option value="128">128</option>
+                </select>
             </div>
             <div class="toolbar-field">
                 <span class="toolbar-field" style="display:block;margin:0;">
@@ -166,14 +180,14 @@
             </div>
             <div class="btn-row">
                 <label class="toolbar-field" style="display:flex;align-items:center;gap:8px;margin:0;font-size:.9rem;font-weight:600;color:#555;">
-                    <input type="checkbox" id="emitPathColors" checked>
+                    <input type="checkbox" id="emitPathColors">
                     写入 PATH_COLOR
                 </label>
                 <button type="button" class="btn" id="batchConvertBtn">SVG 全部 → .icon 并预览</button>
                 <button type="button" class="btn" id="refreshBtn">仅刷新预览</button>
             </div>
             <p class="hint">
-                工作目录<strong>必须由您填写路径</strong>：点「SVG 全部 → .icon」会枚举该目录下所有 <code>.svg</code>，在同目录生成 <code>.icon</code>（与单文件转换逻辑一致），不读取环境变量。取消勾选「写入 PATH_COLOR」时生成的 <code>.icon</code> 不含颜色行，交由 Chromium 运行时模板色上色。随后自动按该目录列出预览图（仅预览图纵向排列，间距 3px）。若只查看已有 <code>.icon</code> 也可填目录后点「仅刷新预览」。
+                工作目录可直接填写、从历史中选择，或点「选择目录…」。最近使用的 10 个目录保存在当前浏览器中。点「SVG 全部 → .icon」会枚举该目录下所有 <code>.svg</code>，在同目录生成 <code>.icon</code>。取消勾选「写入 PATH_COLOR」时生成的 <code>.icon</code> 不含颜色行。
             </p>
             <p id="dirPath" aria-live="polite"></p>
         </div>
@@ -191,21 +205,92 @@
             var scanRootInput = document.getElementById('scanRoot');
             var refreshBtn = document.getElementById('refreshBtn');
             var batchConvertBtn = document.getElementById('batchConvertBtn');
+            var selectDirectoryBtn = document.getElementById('selectDirectoryBtn');
+            var scanRootHistory = document.getElementById('scanRootHistory');
             var iconList = document.getElementById('iconList');
             var emptyEl = document.getElementById('empty');
             var loadErr = document.getElementById('loadErr');
             var dirPath = document.getElementById('dirPath');
             var batchSummary = document.getElementById('batchSummary');
+            var emitPathColorsInput = document.getElementById('emitPathColors');
             var previewBgRadios = document.querySelectorAll('input[name="previewBg"]');
             /** @type {boolean} */
             var useRootQuery = false;
             /** @type {string} */
             var canonicalRootForQuery = '';
+            var historyStorageKey = 'iconPreviewDirectoryHistory';
+            var emitPathColorsStorageKey = 'iconPreviewEmitPathColors';
+
+            function restoreEmitPathColors() {
+                try {
+                    emitPathColorsInput.checked = localStorage.getItem(emitPathColorsStorageKey) === 'true';
+                } catch (ignore) {
+                    emitPathColorsInput.checked = false;
+                }
+            }
+
+            function rememberEmitPathColors() {
+                try {
+                    localStorage.setItem(emitPathColorsStorageKey, String(emitPathColorsInput.checked));
+                } catch (ignore) {}
+            }
+
+            function readDirectoryHistory() {
+                try {
+                    var value = JSON.parse(localStorage.getItem(historyStorageKey) || '[]');
+                    return Array.isArray(value) ? value.filter(function (item) {
+                        return typeof item === 'string' && item.trim().length > 0;
+                    }).slice(0, 10) : [];
+                } catch (ignore) {
+                    return [];
+                }
+            }
+
+            function renderDirectoryHistory() {
+                scanRootHistory.innerHTML = '';
+                readDirectoryHistory().forEach(function (path) {
+                    var option = document.createElement('option');
+                    option.value = path;
+                    scanRootHistory.appendChild(option);
+                });
+            }
+
+            function rememberDirectory(path) {
+                path = (path || '').trim();
+                if (!path) return;
+                var history = readDirectoryHistory().filter(function (item) { return item !== path; });
+                history.unshift(path);
+                try { localStorage.setItem(historyStorageKey, JSON.stringify(history.slice(0, 10))); } catch (ignore) {}
+                renderDirectoryHistory();
+            }
+
+            async function selectDirectory() {
+                selectDirectoryBtn.disabled = true;
+                loadErr.hidden = true;
+                try {
+                    var res = await fetch('/icon_preview_select_directory', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ initial_directory: scanRootInput.value.trim() }),
+                    });
+                    if (!res.ok) throw new Error(await res.text());
+                    var data = await res.json();
+                    if (!data.directory) return;
+                    scanRootInput.value = data.directory;
+                    rememberDirectory(data.directory);
+                    await fetchList();
+                } catch (e) {
+                    loadErr.textContent = '选择目录失败：' + e.message;
+                    loadErr.hidden = false;
+                } finally {
+                    selectDirectoryBtn.disabled = false;
+                }
+            }
 
             function clampSize() {
                 var n = parseInt(sizeInput.value, 10);
                 if (isNaN(n)) n = 64;
-                n = Math.min(512, Math.max(16, n));
+                if ([16, 32, 48, 64, 128].indexOf(n) === -1) n = 64;
                 sizeInput.value = String(n);
                 return n;
             }
@@ -302,7 +387,7 @@
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
                             directory: trimmed,
-                            emit_path_colors: document.getElementById('emitPathColors').checked,
+                            emit_path_colors: emitPathColorsInput.checked,
                         }),
                     });
                     var raw = await res.text();
@@ -347,6 +432,10 @@
                     if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text().catch(function () { return ''; })));
                     var data = await res.json();
                     canonicalRootForQuery = ((data.directory || '') + '').trim();
+                    if (canonicalRootForQuery) {
+                        scanRootInput.value = canonicalRootForQuery;
+                        rememberDirectory(canonicalRootForQuery);
+                    }
                     dirPath.textContent = data.directory ? '当前目录：' + data.directory : '';
                     var icons = data.icons || [];
                     if (icons.length === 0) {
@@ -363,10 +452,9 @@
                 }
             }
 
-            sizeInput.addEventListener('input', function () {
+            sizeInput.addEventListener('change', function () {
                 if (iconList.querySelector('.preview-cell')) applySizesOnly();
             });
-            sizeInput.addEventListener('change', clampSize);
 
             previewBgRadios.forEach(function (radio) {
                 radio.addEventListener('change', function () {
@@ -380,6 +468,12 @@
 
             refreshBtn.addEventListener('click', fetchList);
             batchConvertBtn.addEventListener('click', batchConvertAndPreview);
+            selectDirectoryBtn.addEventListener('click', selectDirectory);
+            emitPathColorsInput.addEventListener('change', rememberEmitPathColors);
+            restoreEmitPathColors();
+            renderDirectoryHistory();
+            var savedDirectories = readDirectoryHistory();
+            if (savedDirectories.length) scanRootInput.value = savedDirectories[0];
             fetchList();
         })();
     </script>
