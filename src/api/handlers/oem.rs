@@ -96,11 +96,8 @@ fn display_icon_preview_directory(path: &std::path::Path) -> String {
 /// - `archive.tar.gz` → `archive.tar-ori.gz`（按最后一个 `.` 切）
 /// - 已经带 `-ori` 后缀的不会再加一遍。
 fn original_storage_name(raw: &str) -> String {
-    let p = std::path::Path::new(raw);
-    let file_name = p
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(raw);
+    // 同时兼容 `/` 与 Windows `\` 分隔符（macOS/Linux 上 `Path` 不把 `\` 视为分隔符）。
+    let file_name = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
     match file_name.rsplit_once('.') {
         Some((stem, ext)) if !stem.is_empty() => {
             if stem.ends_with("-ori") {
@@ -135,21 +132,18 @@ fn convert_output_content_type(file_name: &str) -> &'static str {
     }
 }
 
-/// 供前端预览：从 `convert_work_dir` 读取刚转换的文件（仅单层 basename）。
-pub async fn get_convert_output(Path(file_name): Path<String>) -> impl IntoResponse {
+/// 供前端预览：从 `convert_work_dir`（或查询参数 `root` 指定目录）读取文件（仅单层 basename）。
+pub async fn get_convert_output(
+    Path(file_name): Path<String>,
+    Query(q): Query<IconPreviewRootQuery>,
+) -> impl IntoResponse {
     let safe = match sanitize_convert_output_basename(&file_name) {
         Ok(s) => s,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
-    let work_dir = match convert_work_dir() {
+    let work_dir = match resolve_icon_preview_directory(q.root.as_deref()) {
         Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("convert dir: {}", e),
-            )
-                .into_response();
-        }
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
     let path = work_dir.join(&safe);
     match std::fs::read(&path) {
@@ -271,10 +265,11 @@ pub async fn select_icon_preview_directory(
 #[derive(Serialize)]
 struct IconPreviewList {
     icons: Vec<String>,
+    originals: std::collections::HashMap<String, String>,
     directory: String,
 }
 
-/// 返回给定根目录（或默认 `convert_work_dir`）下所有 `.icon` 文件名（已排序），供批量预览页加载。
+/// 返回给定根目录（或默认 `convert_work_dir`）下所有 `.icon` 文件名（已排序）及同目录匹配的原始 `.svg`，供批量预览页加载。
 ///
 /// 查询参数：`root`，可选；见 [`resolve_icon_preview_directory`]。
 pub async fn list_icon_preview_files(Query(q): Query<IconPreviewRootQuery>) -> impl IntoResponse {
@@ -284,6 +279,8 @@ pub async fn list_icon_preview_files(Query(q): Query<IconPreviewRootQuery>) -> i
     };
     let dir_display = display_icon_preview_directory(&work_dir);
     let mut icons: Vec<String> = Vec::new();
+    let mut svg_by_lower_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let read_dir = match std::fs::read_dir(&work_dir) {
         Ok(r) => r,
         Err(e) => {
@@ -303,18 +300,33 @@ pub async fn list_icon_preview_files(Query(q): Query<IconPreviewRootQuery>) -> i
             Ok(s) => s,
             Err(_) => continue,
         };
-        if !name.to_ascii_lowercase().ends_with(".icon") {
-            continue;
-        }
         // 与下载/预览接口共用同一套 basename 校验，避免列出无法访问的奇怪名字。
         if sanitize_convert_output_basename(&name).is_err() {
             continue;
         }
-        icons.push(name);
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".icon") {
+            icons.push(name);
+        } else if lower.ends_with(".svg") {
+            svg_by_lower_name.insert(lower, name);
+        }
     }
     icons.sort();
+    let mut originals: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for icon_name in &icons {
+        let stem = &icon_name[..icon_name.len().saturating_sub(5)];
+        let candidate_direct = format!("{}.svg", stem).to_ascii_lowercase();
+        let candidate_ori = format!("{}-ori.svg", stem).to_ascii_lowercase();
+        if let Some(svg_name) = svg_by_lower_name
+            .get(&candidate_direct)
+            .or_else(|| svg_by_lower_name.get(&candidate_ori))
+        {
+            originals.insert(icon_name.clone(), svg_name.clone());
+        }
+    }
     Json(IconPreviewList {
         icons,
+        originals,
         directory: dir_display,
     })
     .into_response()
@@ -330,9 +342,9 @@ pub struct IconPreviewBatchConvertRequest {
 }
 
 #[derive(Serialize)]
-struct IconPreviewBatchConvertItemError {
-    file: String,
-    message: String,
+pub struct IconPreviewBatchConvertItemError {
+    pub file: String,
+    pub message: String,
 }
 
 #[derive(Serialize)]
@@ -631,7 +643,11 @@ pub async fn oem_convert(Json(payload): Json<OemRequest>) -> impl IntoResponse {
     };
     
     let logo_path = if !payload.logo_name.is_empty() && !payload.logo_data.is_empty() {
-        let logo_path_buf = logo_dir.join(&payload.logo_name);
+        let safe_logo_name = match sanitize_convert_output_basename(&payload.logo_name) {
+            Ok(name) => name,
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        };
+        let logo_path_buf = logo_dir.join(&safe_logo_name);
         let logo_path_str = match logo_path_buf.to_str() {
             Some(path) => path,
             None => return (StatusCode::BAD_REQUEST, "Invalid logo path").into_response(),
@@ -646,15 +662,24 @@ pub async fn oem_convert(Json(payload): Json<OemRequest>) -> impl IntoResponse {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write logo: {}", e)).into_response();
         }
         
-        let format = payload.logo_name.split('.').last().unwrap_or("png");
+        let format = safe_logo_name.rsplit('.').next().unwrap_or("png").to_ascii_lowercase();
         
         let mut fix_logo_path = std::path::PathBuf::from(logo_path_str);
         if format == "svg" {
             fix_logo_path.set_file_name("tmp.png");
-            if let Some(name) = fix_logo_path.file_name().and_then(|n| n.to_str()) {
-                svg_png::convert_svg_to_png(logo_path_str, name);
+            let logo_owned = logo_path_str.to_string();
+            let png_name = fix_logo_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("tmp.png")
+                .to_string();
+            let svg_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                svg_png::convert_svg_to_png(&logo_owned, &png_name);
+                chromium_icon::convert_svg_to_chromium_icon(&logo_owned, "product.icon");
+            }));
+            if svg_res.is_err() {
+                return (StatusCode::BAD_REQUEST, "Failed to parse or convert SVG logo").into_response();
             }
-            chromium_icon::convert_svg_to_chromium_icon(logo_path_str, "product.icon");
         }
         
         fix_logo_path.to_str().map(|s| s.to_string())
@@ -663,7 +688,11 @@ pub async fn oem_convert(Json(payload): Json<OemRequest>) -> impl IntoResponse {
     };
     
     let document_path = if !payload.document_name.is_empty() && !payload.document_data.is_empty() {
-        let document_path_buf = logo_dir.join(&payload.document_name);
+        let safe_doc_name = match sanitize_convert_output_basename(&payload.document_name) {
+            Ok(name) => name,
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        };
+        let document_path_buf = logo_dir.join(&safe_doc_name);
         let document_path_str = match document_path_buf.to_str() {
             Some(path) => path,
             None => return (StatusCode::BAD_REQUEST, "Invalid document path").into_response(),
@@ -685,11 +714,12 @@ pub async fn oem_convert(Json(payload): Json<OemRequest>) -> impl IntoResponse {
     
     // 使用主题生成器生成所有资源
     if let Some(logo) = logo_path.as_ref() {
-        let oem_name = payload.logo_name.split('.').next().unwrap_or("oem");
+        let safe_logo_name = sanitize_convert_output_basename(&payload.logo_name).unwrap_or_else(|_| "oem".to_string());
+        let oem_name = safe_logo_name.split('.').next().unwrap_or("oem");
         let generator = ThemeGenerator::new(&theme_dir, oem_name);
         
         match generator.generate_all(logo, document_path.as_deref()).await {
-            Ok(_) => (StatusCode::OK, format!("OEM theme resources created successfully in oem/theme/")).into_response(),
+            Ok(_) => (StatusCode::OK, "OEM theme resources created successfully in oem/theme/".to_string()).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to generate theme resources: {}", e)).into_response(),
         }
     } else {
@@ -698,14 +728,22 @@ pub async fn oem_convert(Json(payload): Json<OemRequest>) -> impl IntoResponse {
 }
 
 pub async fn add_rounded_corners(Json(payload): Json<CornerRequest>) -> impl IntoResponse {
-    
-    let logo_path_buf = match current_dir() {
-        Ok(dir) => dir.join(&payload.logo_name),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get current dir: {}", e)).into_response(),
+    let safe_logo_name = match sanitize_convert_output_basename(&payload.logo_name) {
+        Ok(name) => name,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
     
+    let work_dir = match convert_work_dir() {
+        Ok(dir) => dir,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get convert dir: {}", e)).into_response(),
+    };
+    if let Err(e) = std::fs::create_dir_all(&work_dir) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create convert dir: {}", e)).into_response();
+    }
+    let logo_path_buf = work_dir.join(&safe_logo_name);
+    
     let logo_path = match logo_path_buf.to_str() {
-        Some(path) => path,
+        Some(path) => path.to_string(),
         None => return (StatusCode::BAD_REQUEST, "Invalid logo path").into_response(),
     };
     
@@ -714,13 +752,18 @@ pub async fn add_rounded_corners(Json(payload): Json<CornerRequest>) -> impl Int
         Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid base64 data: {}", e)).into_response(),
     };
     
-    if let Err(e) = std::fs::write(logo_path, &logo_data) {
+    if let Err(e) = std::fs::write(&logo_path, &logo_data) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e)).into_response();
     }
     
-    let radius = &payload.radius;
-    let outpath = image_util::apply_rounded_corners(logo_path, radius);
-    (StatusCode::OK, outpath).into_response()
+    let radius = payload.radius.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        image_util::apply_rounded_corners(&logo_path, &radius)
+    }));
+    match result {
+        Ok(outpath) => (StatusCode::OK, outpath).into_response(),
+        Err(_) => (StatusCode::BAD_REQUEST, "Failed to apply rounded corners: invalid image or radius").into_response(),
+    }
 }
 
 #[cfg(test)]

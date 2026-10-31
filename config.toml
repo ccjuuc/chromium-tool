@@ -50,7 +50,8 @@ db_server = "10.0.38.193:3000"
 web = "10.0.38.193:3000"
 smtp = "smtp.163.com"
 from = "ccjuuc@163.com"
-password = "BVjEVanDF2jwbWjF"
+# 建议通过环境变量 PKG_SRV_EMAIL__PASSWORD 注入授权码，避免明文提交仓库
+password = ""
 to = [
   "ccjuuc@163.com"
 ]

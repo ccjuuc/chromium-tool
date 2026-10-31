@@ -69,11 +69,10 @@ impl BuildService {
             parent_id: None,
             architecture,
             installer_format: request.installer_format.clone(),
+            request_json: serde_json::to_string(&request).ok(),
         };
         
         let task_id = task_repo.create(&create_task).await?;
-        // 确保状态为 pending（数据库默认状态）
-        task_repo.update_state(task_id, crate::model::state::TaskState::Pending, None).await?;
         
         Ok(task_id)
     }
@@ -158,17 +157,27 @@ impl BuildService {
                 Some(cancelled_flag),
             ).await;
             
+            // 检查任务是否被取消（通过检查取消标志）
+            let was_cancelled = cancelled_flag_for_check.load(std::sync::atomic::Ordering::SeqCst);
+
             // 任务完成后，记录日志
             if let Err(e) = &result {
                 tracing::error!("任务 #{} 执行失败: {:?}", task_id, e);
-                // 更新数据库状态为 Failed
-                if let Err(update_err) = task_repo_for_fail.update_state(task_id, crate::model::state::TaskState::Failed, None).await {
-                    tracing::error!("更新任务 #{} 状态为 Failed 失败: {:?}", task_id, update_err);
+                let final_state = if was_cancelled {
+                    crate::model::state::TaskState::Cancelled
+                } else {
+                    crate::model::state::TaskState::Failed
+                };
+                if let Err(update_err) = task_repo_for_fail.update_state(task_id, final_state, None).await {
+                    tracing::error!("更新任务 #{} 状态失败: {:?}", task_id, update_err);
+                }
+                // 如果是子任务失败，同步更新父任务状态为失败（若没有其他子任务仍在运行）
+                if let Ok(task) = task_repo_for_fail.find_by_id(task_id).await {
+                    if let Some(parent_id) = task.parent_id {
+                        let _ = task_repo_for_fail.update_state(parent_id, final_state, None).await;
+                    }
                 }
             }
-            
-            // 检查任务是否被取消（通过检查取消标志）
-            let was_cancelled = cancelled_flag_for_check.load(std::sync::atomic::Ordering::Relaxed);
             
             // 如果任务被取消，不启动下一个 pending 任务
             if was_cancelled {
@@ -219,12 +228,10 @@ impl BuildService {
             parent_id: Some(parent_id),  // 设置父任务ID
             architecture,  // 设置架构信息
             installer_format: request.installer_format.clone(),
+            request_json: serde_json::to_string(&request).ok(),
         };
         
         let task_id = task_repo.create(&create_task).await?;
-        
-        // 确保任务状态为 pending（数据库默认状态）
-        task_repo.update_state(task_id, crate::model::state::TaskState::Pending, None).await?;
         
         Ok(task_id)
     }
@@ -326,16 +333,23 @@ impl BuildService {
         
         // 生成 universal pkg
         let universal_out_dir = "out/Release_universal";
-        self.installer.build_installer(src_path, universal_out_dir, None).await?;
+        self.installer.build_installer(src_path, universal_out_dir, request.installer_format.as_deref()).await?;
         
+        // 备份 universal 产物
+        let (storage_path, installer_json) = self
+            .backup_manager
+            .backup_build_artifacts(src_path, universal_out_dir)
+            .await
+            .unwrap_or_default();
+
         // 更新任务状态为成功
         let end_time = time::format_date_time()?;
         let commit_id = request.commit_id.unwrap_or_default();
         task_repo.update_completion(
             parent_id,
             &end_time,
-            "",
-            "",
+            &storage_path,
+            &installer_json,
             if commit_id.is_empty() { None } else { Some(&commit_id) },
         ).await?;
         
@@ -352,7 +366,7 @@ async fn do_build(
     builder: ProjectBuilder,
     compiler: Compiler,
     installer: InstallerBuilder,
-    _backup_manager: BackupManager,
+    backup_manager: BackupManager,
     email_sender: EmailSender,
     ws_manager: Option<crate::api::ws::WsManager>,
     cancelled_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -393,6 +407,8 @@ async fn do_build(
     }
     let total_steps = build_steps.len();
     let mut commit_id = String::new();
+    let mut storage_path = String::new();
+    let mut installer_json = String::new();
     
     // 遍历执行每个构建步骤
     for (index, step) in build_steps.iter().enumerate() {
@@ -484,11 +500,12 @@ async fn do_build(
                 // 检查是否是子任务，如果是子任务且是 macOS 平台，则跳过 installer（组合任务会在父任务中执行）
                 let task = task_repo.find_by_id(task_id).await?;
                 if task.parent_id.is_some() && request.platform == "macos" {
-                    // 这是 macOS 的子任务，跳过 installer，等待父任务的组合步骤
+                    // 这是 macOS 的子任务，跳过 installer，等待父任务的组合步骤（注意不要提前 return 退出整个 do_build）
                     tracing::info!("⏭️  子任务跳过 installer（macOS 组合任务将在父任务中执行）");
-                    return Ok(());
+                    Ok(())
+                } else {
+                    installer.build_installer(src_path, &out_dir, request.installer_format.as_deref()).await
                 }
-                installer.build_installer(src_path, &out_dir, request.installer_format.as_deref()).await
             },
             "combine" => {
                 // 组合步骤：仅用于父任务，组合多个架构的 app 并生成 universal pkg
@@ -516,7 +533,6 @@ async fn do_build(
                 let all_completed = children.iter().all(|child| {
                     matches!(
                         child.state,
-                        crate::model::state::TaskState::BuildingChrome |
                         crate::model::state::TaskState::Combining |
                         crate::model::state::TaskState::BuildingInstaller |
                         crate::model::state::TaskState::Signing |
@@ -533,9 +549,23 @@ async fn do_build(
                 installer.combine_universal_pkg(src_path, &request.architectures).await
             },
             "backup" => {
-                // TODO: 实现备份逻辑
-                tracing::info!("⏭️  备份功能待实现");
-                Ok(())
+                let task = task_repo.find_by_id(task_id).await?;
+                if task.parent_id.is_some() && request.platform == "macos" {
+                    tracing::info!("⏭️  macOS 子任务跳过单独备份（将在父任务合并后统一备份）");
+                    Ok(())
+                } else {
+                    match backup_manager.backup_build_artifacts(src_path, &out_dir).await {
+                        Ok((sp, ij)) => {
+                            storage_path = sp;
+                            installer_json = ij;
+                            Ok(())
+                        }
+                        Err(e) => {
+                            tracing::warn!("⚠️  备份构建产物失败: {}", e);
+                            Ok(())
+                        }
+                    }
+                }
             },
             _ => {
                 tracing::warn!("⚠️  未知的步骤类型: {}", step.step_type);
@@ -572,41 +602,44 @@ async fn do_build(
             // 这是子任务，检查是否刚完成 build chrome
             if step.step_type == "ninja" && step.target.as_deref() == Some("chrome") {
                 // 检查所有子任务是否都完成了 build chrome
-                if let Ok(all_completed) = task_repo.all_children_completed_chrome(parent_id).await {
+                if let Ok(all_completed) = task_repo.all_children_completed_chrome(parent_id, task_id).await {
                     if all_completed {
                         // 所有子任务都完成了 build chrome，启动父任务的组合步骤
                         tracing::info!("✅ 所有子任务完成 build chrome，准备启动组合步骤");
                         
-                        // 获取父任务信息
+                        // 获取父任务信息及所有子任务的架构列表
                         if let Ok(parent_task) = task_repo.find_by_id(parent_id).await {
+                            let children = task_repo.get_child_tasks(parent_id).await.unwrap_or_default();
+                            let parent_archs: Vec<String> = children
+                                .iter()
+                                .filter_map(|c| c.architecture.clone())
+                                .collect();
+
                             // 检查是否是 macOS 平台
                             let platform = if request.platform == "macos" {
                                 "macos"
+                            } else if request.server.contains("macos") || request.server.contains("193") {
+                                "macos"
                             } else {
-                                // 从服务器信息推断平台
-                                if request.server.contains("macos") || request.server.contains("193") {
-                                    "macos"
-                                } else {
-                                    "unknown"
-                                }
+                                request.platform.as_str()
                             };
                             
-                            if platform == "macos" {
-                                // 构建父任务的 BuildRequest
+                            if platform == "macos" && parent_archs.len() >= 2 {
+                                // 构建父任务的 BuildRequest（使用父任务汇总的所有子任务架构列表）
                                 let parent_request = BuildRequest {
                                     branch: parent_task.branch_name.clone(),
                                     commit_id: if parent_task.commit_id.is_empty() { None } else { Some(parent_task.commit_id) },
                                     pkg_flag: parent_task.pkg_flag.clone(),
                                     is_increment: parent_task.is_increment,
-                                    is_x64: false, // 组合任务不关心这个
-                                    architectures: request.architectures.clone(), // 使用原始请求的架构列表
+                                    is_x64: false,
+                                    architectures: parent_archs,
                                     platform: "macos".to_string(),
                                     is_signed: parent_task.is_signed,
                                     server: parent_task.server.clone(),
                                     custom_args: None,
                                     is_update: false,
-                                    emails: None,
-                                    installer_format: request.installer_format.clone(),
+                                    emails: request.emails.clone(),
+                                    installer_format: parent_task.installer_format.or_else(|| request.installer_format.clone()),
                                 };
                                 
                                 // 启动父任务的组合步骤
@@ -615,7 +648,7 @@ async fn do_build(
                                     builder: builder.clone(),
                                     compiler: compiler.clone(),
                                     installer: installer.clone(),
-                                    backup_manager: _backup_manager.clone(),
+                                    backup_manager: backup_manager.clone(),
                                     email_sender: email_sender.clone(),
                                     ws_manager: ws_manager.clone(),
                                 };
@@ -666,10 +699,29 @@ async fn do_build(
     task_repo.update_completion(
         task_id,
         &end_time,
-        "",
-        "",
+        &storage_path,
+        &installer_json,
         Some(&commit_id),
     ).await?;
+
+    // 如果是非 macOS 的多架构子任务且所有兄弟子任务均已成功，同步将父任务标记为成功
+    if let Ok(task) = task_repo.find_by_id(task_id).await {
+        if let Some(parent_id) = task.parent_id {
+            if request.platform != "macos" {
+                if let Ok(children) = task_repo.get_child_tasks(parent_id).await {
+                    if !children.is_empty() && children.iter().all(|c| c.state == crate::model::state::TaskState::Success) {
+                        let _ = task_repo.update_completion(
+                            parent_id,
+                            &end_time,
+                            &storage_path,
+                            &installer_json,
+                            Some(&commit_id),
+                        ).await;
+                    }
+                }
+            }
+        }
+    }
     
     tracing::info!("🎉 =========================================");
     tracing::info!("🎉 构建任务 #{} 完成！", task_id);

@@ -6,31 +6,36 @@ use pic_scale::{
   ImageSize, ImageStore, LinearScaler, ResamplingFunction, Scaling, ThreadingPolicy
 };
 pub fn apply_rounded_corners(fpath: &str, radius: &str) -> String {
-    let left_top_radius : u32;
-    let right_top_radius;
-    let left_bottom_radius;
-    let right_bottom_radius;
-    
-    let radius_vec: Vec<&str> = radius.split(",").collect();
-    if radius_vec.len() == 4 {
-        left_top_radius = radius_vec[0].parse().expect("Failed to parse radius");
-        right_top_radius = radius_vec[1].parse().expect("Failed to parse radius");
-        left_bottom_radius = radius_vec[2].parse().expect("Failed to parse radius");
-        right_bottom_radius = radius_vec[3].parse().expect("Failed to parse radius");
-    } else if radius_vec.len() == 2 {
-        left_top_radius = radius_vec[0].parse().expect("Failed to parse radius");
-        right_top_radius = left_top_radius;
-        left_bottom_radius = radius_vec[1].parse().expect("Failed to parse radius");
-        right_bottom_radius = left_bottom_radius;
-    } else {
-        left_top_radius = radius.parse().expect("Failed to parse radius");
-        right_top_radius = left_top_radius;
-        left_bottom_radius = left_top_radius;
-        right_bottom_radius = left_top_radius;
-    }
+    let parse_r = |s: &str| -> u32 {
+        s.trim().parse::<u32>().expect("Failed to parse radius")
+    };
+    let (mut left_top_radius, mut right_top_radius, mut left_bottom_radius, mut right_bottom_radius) = {
+        let radius_vec: Vec<&str> = radius.split(',').collect();
+        if radius_vec.len() == 4 {
+            (
+                parse_r(radius_vec[0]),
+                parse_r(radius_vec[1]),
+                parse_r(radius_vec[2]),
+                parse_r(radius_vec[3]),
+            )
+        } else if radius_vec.len() == 2 {
+            let top = parse_r(radius_vec[0]);
+            let bottom = parse_r(radius_vec[1]);
+            (top, top, bottom, bottom)
+        } else {
+            let r = parse_r(radius);
+            (r, r, r, r)
+        }
+    };
 
     let img = image::open(fpath).expect("Failed to open input image");
     let (width, height) = img.dimensions();
+    let max_radius = width.min(height) / 2;
+    left_top_radius = left_top_radius.min(max_radius);
+    right_top_radius = right_top_radius.min(max_radius);
+    left_bottom_radius = left_bottom_radius.min(max_radius);
+    right_bottom_radius = right_bottom_radius.min(max_radius);
+
     let scale_factor = 4;
     let scaled_width = width * scale_factor;
     let scaled_height = height * scale_factor;
@@ -38,11 +43,17 @@ pub fn apply_rounded_corners(fpath: &str, radius: &str) -> String {
     let scaled_img = img.resize_exact(scaled_width, scaled_height, image::imageops::FilterType::Lanczos3);
 
     let mut output = ImageBuffer::new(scaled_width, scaled_height);
+    let scaled_radii = vec![
+        left_top_radius * scale_factor,
+        right_top_radius * scale_factor,
+        left_bottom_radius * scale_factor,
+        right_bottom_radius * scale_factor,
+    ];
 
     for y in 0..scaled_height {
         for x in 0..scaled_width {
             let pixel = scaled_img.get_pixel(x, y);
-            if is_inside_rounded_corner(x, y, scaled_width, scaled_height, &vec![left_top_radius * scale_factor, right_top_radius * scale_factor, left_bottom_radius * scale_factor, right_bottom_radius * scale_factor]) {
+            if is_inside_rounded_corner(x, y, scaled_width, scaled_height, &scaled_radii) {
                 output.put_pixel(x, y, Rgba([0, 0, 0, 0]));
             } else {
                 output.put_pixel(x, y, pixel);
@@ -52,44 +63,48 @@ pub fn apply_rounded_corners(fpath: &str, radius: &str) -> String {
 
     let rounded_img = DynamicImage::ImageRgba8(output).resize_exact(width, height, image::imageops::FilterType::Lanczos3);
     let input_path = Path::new(fpath);
-    let mut output_path = PathBuf::from(input_path.parent().unwrap());
-    let file_stem = input_path.file_stem().unwrap().to_str().unwrap();
-    let extension = input_path.extension().unwrap().to_str().unwrap();
+    let mut output_path = PathBuf::from(input_path.parent().unwrap_or_else(|| Path::new(".")));
+    let file_stem = input_path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+    let extension = input_path.extension().and_then(|s| s.to_str()).unwrap_or("png");
     let output_file_name = format!("{}_radius.{}", file_stem, extension);
     output_path.push(output_file_name);
 
-    let output_path_str = output_path.to_str().unwrap().to_string();
+    let output_path_str = output_path.to_string_lossy().to_string();
     rounded_img.save(output_path).expect("Failed to save image");
     output_path_str
 }
 
-fn is_inside_rounded_corner(x: u32, y: u32, width: u32, height: u32, radius: &Vec<u32>) -> bool {
+fn is_inside_rounded_corner(x: u32, y: u32, width: u32, height: u32, radius: &[u32]) -> bool {
     let left_top_radius = radius[0];
     let right_top_radius = radius[1];
     let left_bottom_radius = radius[2];
     let right_bottom_radius = radius[3];
     if x < left_top_radius && y < left_top_radius {
-        let dx = left_top_radius as i32 - x as i32;
-        let dy = left_top_radius as i32 - y as i32;
-        return dx * dx + dy * dy > (left_top_radius * left_top_radius) as i32;
+        let dx = left_top_radius as i64 - x as i64;
+        let dy = left_top_radius as i64 - y as i64;
+        let r = left_top_radius as i64;
+        return dx * dx + dy * dy > r * r;
     }
 
-    if x >= width - right_top_radius && y < right_top_radius {
-        let dx = x as i32 - (width - right_top_radius) as i32;
-        let dy = right_top_radius as i32 - y as i32;
-        return dx * dx + dy * dy > (right_top_radius * right_top_radius) as i32;
+    if x >= width.saturating_sub(right_top_radius) && y < right_top_radius {
+        let dx = x as i64 - width.saturating_sub(right_top_radius) as i64;
+        let dy = right_top_radius as i64 - y as i64;
+        let r = right_top_radius as i64;
+        return dx * dx + dy * dy > r * r;
     }
 
-    if x < left_bottom_radius && y >= height - left_bottom_radius {
-        let dx = left_bottom_radius as i32 - x as i32;
-        let dy = y as i32 - (height - left_bottom_radius) as i32;
-        return dx * dx + dy * dy > (left_bottom_radius * left_bottom_radius) as i32;
+    if x < left_bottom_radius && y >= height.saturating_sub(left_bottom_radius) {
+        let dx = left_bottom_radius as i64 - x as i64;
+        let dy = y as i64 - height.saturating_sub(left_bottom_radius) as i64;
+        let r = left_bottom_radius as i64;
+        return dx * dx + dy * dy > r * r;
     }
 
-    if x >= width - right_bottom_radius && y >= height - right_bottom_radius {
-        let dx = x as i32 - (width - right_bottom_radius) as i32;
-        let dy = y as i32 - (height - right_bottom_radius) as i32;
-        return dx * dx + dy * dy > (right_bottom_radius * right_bottom_radius) as i32;
+    if x >= width.saturating_sub(right_bottom_radius) && y >= height.saturating_sub(right_bottom_radius) {
+        let dx = x as i64 - width.saturating_sub(right_bottom_radius) as i64;
+        let dy = y as i64 - height.saturating_sub(right_bottom_radius) as i64;
+        let r = right_bottom_radius as i64;
+        return dx * dx + dy * dy > r * r;
     }
     false
 }
@@ -197,12 +212,11 @@ pub fn generate_chromium_ico(fpath: &str,out_path: &str) -> String{
     let mut icon_dir = IconDir::new(ico::ResourceType::Icon);
 
     for size in sizes {
-        let save_path = PathBuf::from(input_path.parent().unwrap()).join(format!("{}_{}.png", input_path.file_stem().unwrap().to_str().unwrap(), size));
-        resize_image_with_scaler(fpath, Some(save_path.to_str().unwrap()), size, size);
-        let resized_img = image::open(save_path).expect("Failed to open resized image");
-        let rgb = resized_img.to_rgba8();
-        let icon_image = IconImage::from_rgba_data(size as u32, size as u32, rgb.to_vec());
-        icon_dir.add_entry(ico::IconDirEntry::encode(&icon_image).unwrap());
+        if let Some(resized_img) = resize_image_with_scaler(fpath, None, size, size) {
+            let rgb = resized_img.to_rgba8();
+            let icon_image = IconImage::from_rgba_data(size as u32, size as u32, rgb.to_vec());
+            icon_dir.add_entry(ico::IconDirEntry::encode(&icon_image).expect("Failed to encode ico entry"));
+        }
     }
 
     let file = File::create(output_path.clone()).expect("Failed to create icon file");

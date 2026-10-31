@@ -101,6 +101,10 @@ pub async fn update_task(
         }
     }
     
+    if let Some(service) = &state.task_service {
+        service.cache().invalidate(payload.id).await;
+    }
+
     (StatusCode::OK, "Task updated").into_response()
 }
 
@@ -175,6 +179,8 @@ pub async fn delete_task(
                         tracing::warn!("Failed to update child task {} state: {}", child_task.id, e);
                     }
                 }
+                task_service.cache().invalidate(child_task.id).await;
+                state.ws_manager.remove_channel(child_task.id);
             }
             
             // 父任务本身不会执行，所以只需要更新数据库状态
@@ -218,6 +224,8 @@ pub async fn delete_task(
     if let Err(e) = task_repo.delete(task_id).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete task: {}", e)).into_response();
     }
+    task_service.cache().invalidate(task_id).await;
+    state.ws_manager.remove_channel(task_id);
     
     (StatusCode::OK, "Task deleted").into_response()
 }
@@ -227,7 +235,13 @@ pub async fn download_installer(
     AxumPath(file_path): AxumPath<String>,
 ) -> impl IntoResponse {
     let backup_path = match state.config.get_backup_path() {
-        Ok(path) => path,
+        Ok(path) if !path.trim().is_empty() => path,
+        Ok(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Backup path is empty in configuration".to_string(),
+            ).into_response();
+        }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -236,10 +250,23 @@ pub async fn download_installer(
         }
     };
     
-    let download_file = Path::new(backup_path).join(&file_path);
+    let base_dir = Path::new(backup_path);
+    let candidate_file = base_dir.join(file_path.trim_start_matches('/'));
     
-    if !download_file.exists() {
+    if !candidate_file.exists() {
         return (StatusCode::NOT_FOUND, "File not found").into_response();
+    }
+
+    // 校验规范化路径仍在 backup_path 目录内，防止 ../ 路径穿越攻击
+    let download_file = match crate::util::path::validate_path(&candidate_file, base_dir) {
+        Ok(p) => p,
+        Err(_) => {
+            return (StatusCode::FORBIDDEN, "Access denied: invalid file path").into_response();
+        }
+    };
+
+    if !download_file.is_file() {
+        return (StatusCode::BAD_REQUEST, "Requested path is not a file").into_response();
     }
     
     let file_name = match download_file

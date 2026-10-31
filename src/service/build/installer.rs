@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::process::Command;
+use tokio::process::Command;
 use anyhow::{Context, Result};
 use crate::config::AppConfig;
 
@@ -61,11 +61,13 @@ impl InstallerBuilder {
                 .arg(os::SHELL[1])
                 .arg(&command)
                 .current_dir(src_path)
+                .kill_on_drop(true)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .context(format!("Failed to spawn ninja for target: {}", target))?
                 .wait_with_output()
+                .await
                 .context(format!("Failed to wait for ninja: {}", target))?;
             
             let duration = start_time.elapsed();

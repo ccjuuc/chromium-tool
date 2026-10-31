@@ -29,7 +29,30 @@ impl Compiler {
         Self { config }
     }
     
-    /// 执行 ninja 命令（支持命令列表，实时捕获输出）
+    /// 终止子进程及其所属的整个进程组
+    async fn terminate_child(child: &mut tokio::process::Child) {
+        tracing::warn!("⚠️  任务已取消，正在终止 ninja 进程...");
+        let pid = child.id();
+
+        #[cfg(unix)]
+        {
+            if let Some(id) = pid {
+                tracing::info!("🛑 尝试终止进程组 {}...", id);
+                let _ = std::process::Command::new("kill")
+                    .arg("-TERM")
+                    .arg(format!("-{}", id))
+                    .output();
+            }
+        }
+
+        if let Err(e) = child.kill().await {
+            tracing::warn!("Failed to kill ninja process: {}", e);
+        } else {
+            tracing::info!("✅ ninja 进程已终止 (PID: {:?})", pid);
+        }
+    }
+
+    /// 执行 ninja 命令（支持命令列表，实时并发捕获 stdout / stderr 输出）
     async fn run_ninja(
         &self,
         src_path: &Path,
@@ -62,255 +85,120 @@ impl Compiler {
             
             let start_time = std::time::Instant::now();
             
-            // 使用 tokio::process::Command 来实时捕获输出
-            let mut child = Command::new(os::SHELL[0])
-                .arg(os::SHELL[1])
+            // 使用 tokio::process::Command 实时捕获输出，并启用 kill_on_drop 和独立进程组
+            let mut cmd = Command::new(os::SHELL[0]);
+            cmd.arg(os::SHELL[1])
                 .arg(&command)
                 .current_dir(src_path)
+                .kill_on_drop(true)
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            #[cfg(unix)]
+            {
+                cmd.process_group(0);
+            }
+
+            let mut child = cmd
                 .spawn()
                 .context(format!("Failed to spawn ninja for target: {}", target))?;
             
             let mut stdout_lines = Vec::new();
             let mut stderr_lines = Vec::new();
-            
-            // 实时读取 stdout
-            if let Some(stdout) = child.stdout.take() {
-                let mut reader = BufReader::new(stdout).lines();
-                loop {
-                    // 检查取消标志
-                    if let Some(flag) = &cancelled_flag {
-                        if flag.load(Ordering::Relaxed) {
-                            tracing::warn!("⚠️  任务已取消，正在终止 ninja 进程...");
-                            eprintln!("⚠️  任务已取消，正在终止 ninja 进程...");
-                            
-                            // 获取进程 ID（在 kill 之前）
-                            let pid = child.id();
-                            
-                            // 终止子进程及其子进程
-                            if let Err(e) = child.kill().await {
-                                tracing::warn!("Failed to kill ninja process: {}", e);
-                                eprintln!("⚠️  终止 ninja 进程失败: {}", e);
-                            } else {
-                                tracing::info!("✅ ninja 进程已终止 (PID: {:?})", pid);
-                                eprintln!("✅ ninja 进程已终止 (PID: {:?})", pid);
-                            }
-                            
-                            // 尝试终止整个进程组（Unix 系统）
-                            #[cfg(unix)]
-                            {
-                                if let Some(id) = pid {
-                                    tracing::info!("🛑 尝试终止进程组 {}...", id);
-                                    eprintln!("🛑 尝试终止进程组 {}...", id);
-                                    
-                                    // 使用 killpg 终止整个进程组
-                                    let output = std::process::Command::new("kill")
-                                        .arg("-TERM")
-                                        .arg(&format!("-{}", id))
-                                        .output();
-                                    
-                                    match output {
-                                        Ok(output) if output.status.success() => {
-                                            tracing::info!("✅ 进程组 {} 已终止", id);
-                                            eprintln!("✅ 进程组 {} 已终止", id);
-                                        },
-                                        Ok(output) => {
-                                            tracing::warn!("⚠️  终止进程组 {} 失败: {:?}", id, output.status);
-                                            eprintln!("⚠️  终止进程组 {} 失败", id);
-                                        },
-                                        Err(e) => {
-                                            tracing::warn!("⚠️  无法执行 kill 命令: {}", e);
-                                            eprintln!("⚠️  无法执行 kill 命令: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            return Err(anyhow::anyhow!("Task cancelled"));
-                        }
-                    }
-                    
-                    match reader.next_line().await {
-                        Ok(Some(line)) => {
-                            let line = line.trim_end().to_string();
-                            if !line.is_empty() {
-                                // 检测是否是进度行（格式：[数字/数字] 开头）
-                                // 例如：[390/51744] CXX obj/... 或 [1660/37976] COPY ...
-                                // 简化匹配：只要以 [数字/数字] 开头就认为是进度行
-                                let is_progress = {
-                                    let trimmed = line.trim_start();
-                                    if trimmed.starts_with('[') {
-                                        // 使用正则表达式匹配 [数字/数字] 模式
-                                        use regex::Regex;
-                                        static PROGRESS_PATTERN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-                                        let pattern = PROGRESS_PATTERN.get_or_init(|| {
-                                            Regex::new(r"^\[\d+/\d+\]").unwrap()
-                                        });
-                                        pattern.is_match(trimmed)
-                                    } else {
-                                        false
-                                    }
-                                };
-                                
-                                if !is_progress {
-                                    // 非进度行：追加到列表并输出到日志
-                                    stdout_lines.push(line.clone());
-                                    tracing::info!("{}", line);
-                                } else {
-                                    // 进度行：在同一行刷新显示（使用 \r 回到行首，\x1b[2K 清除整行）
-                                    use std::io::{self, Write};
-                                    let _ = io::stderr().write_all(b"\x1b[2K\r"); // 清除当前行并回到行首
-                                    let _ = io::stderr().write_all(line.as_bytes()); // 输出新内容
-                                    let _ = io::stderr().flush(); // 立即刷新
-                                }
-                                
-                                // 保存到数据库并广播到 WebSocket
-                                if let (Some(tid), Some(repo)) = (task_id, task_repo) {
-                                    if !is_progress {
-                                        // 只有非进度行才保存到数据库（避免刷屏）
-                                        let _ = repo.append_build_log(tid, &line).await;
-                                    }
-                                    // 所有行都通过 WebSocket 发送（包括进度行）
-                                    if let Some(ws) = ws_manager {
-                                        ws.broadcast_log(tid, line.clone(), is_progress);
-                                    }
-                                }
-                            }
-                        },
-                        Ok(None) => break, // EOF
-                        Err(_) => break,   // 读取错误
+
+            let stdout = child.stdout.take().context("Failed to capture ninja stdout")?;
+            let stderr = child.stderr.take().context("Failed to capture ninja stderr")?;
+            let mut stdout_reader = BufReader::new(stdout).lines();
+            let mut stderr_reader = BufReader::new(stderr).lines();
+            let mut stdout_done = false;
+            let mut stderr_done = false;
+
+            // 并发读取 stdout 与 stderr，防止任一管道缓冲区写满导致死锁，同时每 50ms 轮询取消标志
+            while !stdout_done || !stderr_done {
+                if let Some(flag) = &cancelled_flag {
+                    if flag.load(Ordering::SeqCst) {
+                        Self::terminate_child(&mut child).await;
+                        return Err(anyhow::anyhow!("Task cancelled"));
                     }
                 }
-            }
-            
-            // 实时读取 stderr
-            if let Some(stderr) = child.stderr.take() {
-                let mut reader = BufReader::new(stderr).lines();
-                loop {
-                    // 检查取消标志
-                    if let Some(flag) = &cancelled_flag {
-                        if flag.load(Ordering::Relaxed) {
-                            tracing::warn!("⚠️  任务已取消，正在终止 ninja 进程...");
-                            eprintln!("⚠️  任务已取消，正在终止 ninja 进程...");
-                            
-                            // 获取进程 ID（在 kill 之前）
-                            let pid = child.id();
-                            
-                            // 终止子进程及其子进程
-                            if let Err(e) = child.kill().await {
-                                tracing::warn!("Failed to kill ninja process: {}", e);
-                                eprintln!("⚠️  终止 ninja 进程失败: {}", e);
-                            } else {
-                                tracing::info!("✅ ninja 进程已终止 (PID: {:?})", pid);
-                                eprintln!("✅ ninja 进程已终止 (PID: {:?})", pid);
-                            }
-                            
-                            // 尝试终止整个进程组（Unix 系统）
-                            #[cfg(unix)]
-                            {
-                                if let Some(id) = pid {
-                                    tracing::info!("🛑 尝试终止进程组 {}...", id);
-                                    eprintln!("🛑 尝试终止进程组 {}...", id);
-                                    
-                                    // 使用 killpg 终止整个进程组
-                                    let output = std::process::Command::new("kill")
-                                        .arg("-TERM")
-                                        .arg(&format!("-{}", id))
-                                        .output();
-                                    
-                                    match output {
-                                        Ok(output) if output.status.success() => {
-                                            tracing::info!("✅ 进程组 {} 已终止", id);
-                                            eprintln!("✅ 进程组 {} 已终止", id);
-                                        },
-                                        Ok(output) => {
-                                            tracing::warn!("⚠️  终止进程组 {} 失败: {:?}", id, output.status);
-                                            eprintln!("⚠️  终止进程组 {} 失败", id);
-                                        },
-                                        Err(e) => {
-                                            tracing::warn!("⚠️  无法执行 kill 命令: {}", e);
-                                            eprintln!("⚠️  无法执行 kill 命令: {}", e);
+
+                tokio::select! {
+                    res = stdout_reader.next_line(), if !stdout_done => {
+                        match res {
+                            Ok(Some(line)) => {
+                                let line = line.trim_end().to_string();
+                                if !line.is_empty() {
+                                    let is_progress = {
+                                        let trimmed = line.trim_start();
+                                        if trimmed.starts_with('[') {
+                                            use regex::Regex;
+                                            static PROGRESS_PATTERN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+                                            let pattern = PROGRESS_PATTERN.get_or_init(|| {
+                                                Regex::new(r"^\[\d+/\d+\]").unwrap()
+                                            });
+                                            pattern.is_match(trimmed)
+                                        } else {
+                                            false
+                                        }
+                                    };
+
+                                    if !is_progress {
+                                        stdout_lines.push(line.clone());
+                                        tracing::info!("{}", line);
+                                    } else {
+                                        use std::io::{self, Write};
+                                        let _ = io::stderr().write_all(b"\x1b[2K\r");
+                                        let _ = io::stderr().write_all(line.as_bytes());
+                                        let _ = io::stderr().flush();
+                                    }
+
+                                    if let (Some(tid), Some(repo)) = (task_id, task_repo) {
+                                        if !is_progress {
+                                            let _ = repo.append_build_log(tid, &line).await;
+                                        }
+                                        if let Some(ws) = ws_manager {
+                                            ws.broadcast_log(tid, line.clone(), is_progress);
                                         }
                                     }
                                 }
                             }
-                            
-                            return Err(anyhow::anyhow!("Task cancelled"));
+                            _ => {
+                                stdout_done = true;
+                            }
                         }
                     }
-                    
-                    match reader.next_line().await {
-                        Ok(Some(line)) => {
-                            let line = line.trim_end().to_string();
-                            if !line.is_empty() {
-                                stderr_lines.push(line.clone());
-                                tracing::warn!("{}", line);
-                                
-                                // 保存到数据库并广播到 WebSocket
-                                if let (Some(tid), Some(repo)) = (task_id, task_repo) {
-                                    let log_line = format!("[WARN] {}", line);
-                                    let _ = repo.append_build_log(tid, &log_line).await;
-                                    if let Some(ws) = ws_manager {
-                                        ws.broadcast_log(tid, log_line, false);  // stderr 不是进度行
+                    res = stderr_reader.next_line(), if !stderr_done => {
+                        match res {
+                            Ok(Some(line)) => {
+                                let line = line.trim_end().to_string();
+                                if !line.is_empty() {
+                                    stderr_lines.push(line.clone());
+                                    tracing::warn!("{}", line);
+
+                                    if let (Some(tid), Some(repo)) = (task_id, task_repo) {
+                                        let log_line = format!("[WARN] {}", line);
+                                        let _ = repo.append_build_log(tid, &log_line).await;
+                                        if let Some(ws) = ws_manager {
+                                            ws.broadcast_log(tid, log_line, false);
+                                        }
                                     }
                                 }
                             }
-                        },
-                        Ok(None) => break, // EOF
-                        Err(_) => break,   // 读取错误
+                            _ => {
+                                stderr_done = true;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)), if cancelled_flag.is_some() => {
+                        // 定期唤醒以检查循环头部的 cancelled_flag
                     }
                 }
             }
             
             // 再次检查取消标志（在等待进程完成前）
             if let Some(flag) = &cancelled_flag {
-                if flag.load(Ordering::Relaxed) {
-                    tracing::warn!("⚠️  任务已取消，正在终止 ninja 进程...");
-                    eprintln!("⚠️  任务已取消，正在终止 ninja 进程...");
-                    
-                    // 获取进程 ID（在 kill 之前）
-                    let pid = child.id();
-                    
-                    // 终止子进程及其子进程
-                    if let Err(e) = child.kill().await {
-                        tracing::warn!("Failed to kill ninja process: {}", e);
-                        eprintln!("⚠️  终止 ninja 进程失败: {}", e);
-                    } else {
-                        tracing::info!("✅ ninja 进程已终止 (PID: {:?})", pid);
-                        eprintln!("✅ ninja 进程已终止 (PID: {:?})", pid);
-                    }
-                    
-                    // 尝试终止整个进程组（Unix 系统）
-                    #[cfg(unix)]
-                    {
-                        if let Some(id) = pid {
-                            tracing::info!("🛑 尝试终止进程组 {}...", id);
-                            eprintln!("🛑 尝试终止进程组 {}...", id);
-                            
-                            // 使用 killpg 终止整个进程组
-                            let output = std::process::Command::new("kill")
-                                .arg("-TERM")
-                                .arg(&format!("-{}", id))
-                                .output();
-                            
-                            match output {
-                                Ok(output) if output.status.success() => {
-                                    tracing::info!("✅ 进程组 {} 已终止", id);
-                                    eprintln!("✅ 进程组 {} 已终止", id);
-                                },
-                                Ok(output) => {
-                                    tracing::warn!("⚠️  终止进程组 {} 失败: {:?}", id, output.status);
-                                    eprintln!("⚠️  终止进程组 {} 失败", id);
-                                },
-                                Err(e) => {
-                                    tracing::warn!("⚠️  无法执行 kill 命令: {}", e);
-                                    eprintln!("⚠️  无法执行 kill 命令: {}", e);
-                                }
-                            }
-                        }
-                    }
-                    
+                if flag.load(Ordering::SeqCst) {
+                    Self::terminate_child(&mut child).await;
                     return Err(anyhow::anyhow!("Task cancelled"));
                 }
             }

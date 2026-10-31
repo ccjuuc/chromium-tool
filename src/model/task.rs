@@ -24,6 +24,8 @@ pub struct Task {
     pub build_log: Option<String>,  // 构建日志
     #[serde(default)]
     pub installer_format: Option<String>,  // 安装包格式：dmg 或 pkg
+    #[serde(skip)]
+    pub request_json: Option<String>,  // 序列化的原始 BuildRequest，用于排队恢复
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +40,8 @@ pub struct CreateTask {
     pub parent_id: Option<i64>,  // 父任务ID
     pub architecture: Option<String>,  // 架构信息
     pub installer_format: Option<String>,  // 安装包格式：dmg 或 pkg
+    #[serde(default)]
+    pub request_json: Option<String>,  // 序列化的原始 BuildRequest
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +79,7 @@ impl Default for Task {
             architecture: None,
             build_log: None,
             installer_format: None,
+            request_json: None,
         }
     }
 }

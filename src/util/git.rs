@@ -1,6 +1,6 @@
 use std::path::Path;
 use anyhow::{Context, Result};
-use std::process::Command;
+use tokio::process::Command;
 use crate::util::retry::retry_async;
 
 pub async fn update_code(
@@ -16,6 +16,7 @@ pub async fn update_code(
         .arg("stash")
         .current_dir(src_path)
         .output()
+        .await
         .context("Failed to stash changes")?;
     let duration = start_time.elapsed();
     let exit_code = stash_output.status.code().unwrap_or(-1);
@@ -38,6 +39,7 @@ pub async fn update_code(
             .arg(commit)
             .current_dir(src_path)
             .output()
+            .await
             .context("Failed to checkout commit")?;
         let duration = start_time.elapsed();
         let exit_code = checkout_output.status.code().unwrap_or(-1);
@@ -69,6 +71,7 @@ pub async fn update_code(
         .arg(branch)
         .current_dir(src_path)
         .output()
+        .await
         .context("Failed to checkout branch")?;
     let duration = start_time.elapsed();
     let exit_code = checkout_output.status.code().unwrap_or(-1);
@@ -98,7 +101,8 @@ pub async fn update_code(
         let output = Command::new("git")
             .arg("pull")
             .current_dir(src_path)
-            .output()?;
+            .output()
+            .await?;
         
         let exit_code = output.status.code().unwrap_or(-1);
         if !output.stdout.is_empty() {
@@ -134,6 +138,7 @@ pub async fn get_commit_id(src_path: &Path) -> Result<String> {
         .args(&["rev-parse", "HEAD"])
         .current_dir(src_path)
         .output()
+        .await
         .context("Failed to get commit id")?;
     
     let exit_code = output.status.code().unwrap_or(-1);
@@ -163,6 +168,7 @@ pub async fn get_branch_list(src_path: &Path) -> Result<Vec<String>> {
         .args(&["branch", "-a"])
         .current_dir(src_path)
         .output()
+        .await
         .context("Failed to get branch list")?;
     
     let exit_code = output.status.code().unwrap_or(-1);

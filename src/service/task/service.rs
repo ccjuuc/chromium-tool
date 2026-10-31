@@ -57,4 +57,8 @@ impl TaskService {
     pub fn manager(&self) -> &TaskManager {
         &self.manager
     }
+
+    pub fn cache(&self) -> &TaskCache {
+        &self.cache
+    }
 }

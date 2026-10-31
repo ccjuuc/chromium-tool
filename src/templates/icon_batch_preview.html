@@ -13,8 +13,8 @@
             padding: 24px;
             color: #333;
         }
-        .container { max-width: 840px; margin: 0 auto; }
-        .header { text-align: center; color: #fff; margin-bottom: 28px; }
+        .container { max-width: 1560px; margin: 0 auto; }
+        .header { text-align: center; color: #fff; margin-bottom: 24px; }
         .header h1 { font-size: 1.75rem; margin-bottom: 8px; text-shadow: 0 1px 3px rgba(0,0,0,.2); }
         .header a {
             color: #fff; opacity: .95; font-size: .95rem;
@@ -30,6 +30,9 @@
             flex-wrap: wrap;
             align-items: flex-end;
             gap: 18px 24px;
+            max-width: 960px;
+            margin-left: auto;
+            margin-right: auto;
         }
         .toolbar-field label {
             display: block;
@@ -80,17 +83,62 @@
             margin-top: -4px;
         }
         #dirPath { font-family: ui-monospace, monospace; font-size: .78rem; color: #666; word-break: break-all; flex: 1 1 100%; }
+        .legend {
+            text-align: center;
+            color: rgba(255, 255, 255, 0.92);
+            font-size: 0.85rem;
+            margin-bottom: 10px;
+        }
         .list {
             display: flex;
-            flex-direction: column;
-            gap: 3px;
+            flex-direction: row;
+            flex-wrap: wrap;
+            gap: 16px 10px;
             align-items: flex-start;
-            width: max-content;
-            max-width: 100%;
+            justify-content: flex-start;
+            width: 100%;
             margin: 0 auto;
             background: rgba(255,255,255,.12);
+            padding: 14px;
+            border-radius: 10px;
+        }
+        .preview-col {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+            background: rgba(0, 0, 0, 0.16);
             padding: 6px;
             border-radius: 8px;
+            flex-shrink: 0;
+        }
+        .preview-row-tag {
+            font-size: 10px;
+            line-height: 1.2;
+            color: rgba(255, 255, 255, 0.78);
+            user-select: none;
+        }
+        .preview-name {
+            font-size: 11px;
+            line-height: 1.25;
+            color: #fff;
+            font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+            text-align: center;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-top: 2px;
+            max-width: 100%;
+        }
+        .preview-missing {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            height: 100%;
+            font-size: 11px;
+            color: #999;
+            user-select: none;
         }
         .bg-options {
             display: flex;
@@ -114,6 +162,7 @@
             border-radius: 4px;
             overflow: hidden;
             flex-shrink: 0;
+            position: relative;
         }
         .preview-cell.bg-light { background: #ffffff; }
         .preview-cell.bg-dark { background: #111111; }
@@ -180,7 +229,7 @@
             </div>
             <div class="btn-row">
                 <label class="toolbar-field" style="display:flex;align-items:center;gap:8px;margin:0;font-size:.9rem;font-weight:600;color:#555;">
-                    <input type="checkbox" id="emitPathColors">
+                    <input type="checkbox" id="emitPathColors" checked>
                     写入 PATH_COLOR
                 </label>
                 <button type="button" class="btn" id="batchConvertBtn">SVG 全部 → .icon 并预览</button>
@@ -196,6 +245,7 @@
 
         <div id="loadErr" hidden></div>
         <div id="empty" hidden>当前目录下没有找到 .icon 文件。请调整目录或先在「格式转换」中导出 .icon。</div>
+        <div class="legend" id="previewLegend" hidden>横排对比：<strong>上排为 SVG 原图</strong>，<strong>下排为转换后 .icon 预览</strong>（悬停可查看完整文件名）</div>
         <div class="list" id="iconList"></div>
     </div>
 
@@ -213,19 +263,23 @@
             var dirPath = document.getElementById('dirPath');
             var batchSummary = document.getElementById('batchSummary');
             var emitPathColorsInput = document.getElementById('emitPathColors');
+            var previewLegend = document.getElementById('previewLegend');
             var previewBgRadios = document.querySelectorAll('input[name="previewBg"]');
             /** @type {boolean} */
             var useRootQuery = false;
             /** @type {string} */
             var canonicalRootForQuery = '';
+            /** @type {Object<string, string>} */
+            var currentOriginalsMap = {};
             var historyStorageKey = 'iconPreviewDirectoryHistory';
             var emitPathColorsStorageKey = 'iconPreviewEmitPathColors';
 
             function restoreEmitPathColors() {
                 try {
-                    emitPathColorsInput.checked = localStorage.getItem(emitPathColorsStorageKey) === 'true';
+                    var saved = localStorage.getItem(emitPathColorsStorageKey);
+                    emitPathColorsInput.checked = saved === null ? true : saved === 'true';
                 } catch (ignore) {
-                    emitPathColorsInput.checked = false;
+                    emitPathColorsInput.checked = true;
                 }
             }
 
@@ -305,11 +359,21 @@
                 iconList.querySelectorAll('.preview-cell').forEach(function (cell) {
                     cell.classList.remove('bg-light', 'bg-dark');
                     cell.classList.add(bg);
-                    var img = cell.querySelector('.preview-img');
+                    var img = cell.querySelector('.conv-img');
                     if (!img) return;
-                    var name = img.getAttribute('aria-label') || img.title;
+                    var name = img.getAttribute('data-icon-name');
                     if (name) img.src = svgUrl(name);
                 });
+            }
+
+            function origSvgUrl(svgName) {
+                var u = '/convert_output/' + encodeURIComponent(svgName).replace(/'/g, '%27');
+                var params = [];
+                if (useRootQuery && canonicalRootForQuery.length > 0) {
+                    params.push('root=' + encodeURIComponent(canonicalRootForQuery));
+                }
+                params.push('_t=' + Date.now());
+                return u + '?' + params.join('&');
             }
 
             function svgUrl(name) {
@@ -321,41 +385,98 @@
                 if (previewBgClass() === 'bg-dark') {
                     params.push('bg=dark');
                 }
+                params.push('_t=' + Date.now());
                 if (params.length) u += '?' + params.join('&');
                 return u;
             }
 
-            function render(icons) {
+            function render(icons, originalsMap) {
                 var px = clampSize();
                 var bg = previewBgClass();
+                currentOriginalsMap = originalsMap || {};
                 iconList.innerHTML = '';
+                previewLegend.hidden = icons.length === 0;
+                var labelWidth = Math.max(px, 72);
                 icons.forEach(function (name) {
-                    var cell = document.createElement('div');
-                    cell.className = 'preview-cell ' + bg;
-                    cell.style.width = px + 'px';
-                    cell.style.height = px + 'px';
-                    var img = document.createElement('img');
-                    img.className = 'preview-img';
-                    img.width = px;
-                    img.height = px;
-                    img.src = svgUrl(name);
-                    img.loading = 'lazy';
-                    img.alt = '';
-                    img.setAttribute('aria-label', name);
-                    img.title = name;
-                    img.onerror = function () {
-                        img.alt = '!';
-                        img.style.background = 'rgba(220,220,230,.95)';
-                        img.style.minWidth = px + 'px';
-                        img.style.minHeight = px + 'px';
+                    var stem = name.replace(/\.icon$/i, '');
+                    var origName = currentOriginalsMap[name] || (stem + '.svg');
+
+                    var col = document.createElement('div');
+                    col.className = 'preview-col';
+                    col.style.width = (labelWidth + 12) + 'px';
+                    col.title = '原图: ' + origName + '\n转换后: ' + name;
+
+                    var topTag = document.createElement('span');
+                    topTag.className = 'preview-row-tag';
+                    topTag.textContent = '原图';
+                    col.appendChild(topTag);
+
+                    // 上排：SVG 原图
+                    var origCell = document.createElement('div');
+                    origCell.className = 'preview-cell orig-cell ' + bg;
+                    origCell.style.width = px + 'px';
+                    origCell.style.height = px + 'px';
+                    var origImg = document.createElement('img');
+                    origImg.className = 'preview-img orig-img';
+                    origImg.width = px;
+                    origImg.height = px;
+                    origImg.src = origSvgUrl(origName);
+                    origImg.loading = 'lazy';
+                    origImg.alt = '';
+                    origImg.title = '原图: ' + origName;
+                    origImg.onerror = function () {
+                        origCell.innerHTML = '<span class="preview-missing" title="未找到原图 ' + origName + '">无原图</span>';
                     };
-                    cell.appendChild(img);
-                    iconList.appendChild(cell);
+                    origCell.appendChild(origImg);
+                    col.appendChild(origCell);
+
+                    var botTag = document.createElement('span');
+                    botTag.className = 'preview-row-tag';
+                    botTag.textContent = '预览';
+                    col.appendChild(botTag);
+
+                    // 下排：转换后 .icon 预览
+                    var convCell = document.createElement('div');
+                    convCell.className = 'preview-cell conv-cell ' + bg;
+                    convCell.style.width = px + 'px';
+                    convCell.style.height = px + 'px';
+                    var convImg = document.createElement('img');
+                    convImg.className = 'preview-img conv-img';
+                    convImg.width = px;
+                    convImg.height = px;
+                    convImg.src = svgUrl(name);
+                    convImg.loading = 'lazy';
+                    convImg.alt = '';
+                    convImg.setAttribute('data-icon-name', name);
+                    convImg.setAttribute('aria-label', name);
+                    convImg.title = '转换后: ' + name;
+                    convImg.onerror = function () {
+                        convImg.alt = '!';
+                        convImg.style.background = 'rgba(220,220,230,.95)';
+                        convImg.style.minWidth = px + 'px';
+                        convImg.style.minHeight = px + 'px';
+                    };
+                    convCell.appendChild(convImg);
+                    col.appendChild(convCell);
+
+                    var caption = document.createElement('div');
+                    caption.className = 'preview-name';
+                    caption.style.width = labelWidth + 'px';
+                    caption.textContent = stem;
+                    col.appendChild(caption);
+
+                    iconList.appendChild(col);
                 });
             }
 
             function applySizesOnly() {
                 var px = clampSize();
+                var labelWidth = Math.max(px, 72);
+                iconList.querySelectorAll('.preview-col').forEach(function (col) {
+                    col.style.width = (labelWidth + 12) + 'px';
+                    var cap = col.querySelector('.preview-name');
+                    if (cap) cap.style.width = labelWidth + 'px';
+                });
                 iconList.querySelectorAll('.preview-cell').forEach(function (cell) {
                     cell.style.width = px + 'px';
                     cell.style.height = px + 'px';
@@ -439,11 +560,12 @@
                     dirPath.textContent = data.directory ? '当前目录：' + data.directory : '';
                     var icons = data.icons || [];
                     if (icons.length === 0) {
+                        previewLegend.hidden = true;
                         emptyEl.hidden = false;
                         return;
                     }
                     emptyEl.hidden = true;
-                    render(icons);
+                    render(icons, data.originals || {});
                 } catch (e) {
                     loadErr.textContent = '加载列表失败：' + e.message;
                     loadErr.hidden = false;

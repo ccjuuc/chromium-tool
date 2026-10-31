@@ -42,10 +42,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/oem_convert", post(handlers::oem::oem_convert))
         .route("/add_rounded_corners", post(handlers::oem::add_rounded_corners))
         
-        // 构建路由（限制并发为 1）
+        // 构建路由（仅对 /build_package POST 请求限制并发为 1，避免阻塞页面与 OEM 路由）
         .route("/build", get(handlers::build::build_page))
-        .route("/build_package", post(handlers::build::build_package))
-        .layer(ConcurrencyLimitLayer::new(1))  // 高优先级：限流
+        .route(
+            "/build_package",
+            post(handlers::build::build_package).layer(ConcurrencyLimitLayer::new(1)),
+        )
         
         // 任务路由
         .route("/task_list", get(handlers::task::task_list))

@@ -16,14 +16,17 @@ impl BackupManager {
         Self { config }
     }
     
-    #[allow(dead_code)]
     pub async fn backup_files(
         &self,
         src_path: &Path,
         oem: &str,
-        installer_files: &[(String, String)],  // (path, md5)
+        installer_files: &[(String, String)],  // (path, md5/sha256)
     ) -> Result<String> {
-        let backup_base = Path::new(self.config.get_backup_path()?);
+        let backup_base_str = self.config.get_backup_path()?;
+        if backup_base_str.trim().is_empty() {
+            return Err(anyhow::anyhow!("Backup path is not configured"));
+        }
+        let backup_base = Path::new(backup_base_str);
         
         // 创建日期目录
         let date_subfolder = time::format_date_folder()?;
@@ -45,6 +48,67 @@ impl BackupManager {
         }
         
         Ok(date_dir.to_string_lossy().to_string())
+    }
+
+    /// 扫描输出目录中的安装包产物并执行备份，返回 (storage_path, installers_json)
+    pub async fn backup_build_artifacts(
+        &self,
+        src_path: &Path,
+        out_dir: &str,
+    ) -> Result<(String, String)> {
+        let out_path = src_path.join(out_dir);
+        let signed_dir = out_path.join("signed");
+        let candidate_dirs = [signed_dir, out_path];
+        let installer_exts = ["dmg", "pkg", "exe", "deb", "rpm", "msi", "zip", "7z"];
+
+        let mut full_files: Vec<(String, String)> = Vec::new();
+        let mut meta_files: Vec<(String, String)> = Vec::new();
+
+        for dir in &candidate_dirs {
+            if !dir.exists() || !dir.is_dir() {
+                continue;
+            }
+            for entry in WalkDir::new(dir)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let ext_match = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .is_some_and(|ext| installer_exts.contains(&ext.as_str()));
+                if !ext_match {
+                    continue;
+                }
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                    let file_hash = hash::calculate_file_hash(path).await.unwrap_or_default();
+                    full_files.push((path.to_string_lossy().to_string(), file_hash.clone()));
+                    meta_files.push((file_name.to_string(), file_hash));
+                }
+            }
+            if !full_files.is_empty() {
+                break;
+            }
+        }
+
+        if full_files.is_empty() {
+            tracing::info!("ℹ️  未在 {} 下发现可备份的安装包文件", out_dir);
+            return Ok((String::new(), String::new()));
+        }
+
+        let installers_json = serde_json::to_string(&meta_files)?;
+        match self.backup_files(src_path, "", &full_files).await {
+            Ok(storage_path) => Ok((storage_path, installers_json)),
+            Err(e) => {
+                tracing::warn!("⚠️  备份安装包到备份目录失败 ({})，仅记录安装包元数据", e);
+                Ok((String::new(), installers_json))
+            }
+        }
     }
     
     #[allow(dead_code)]

@@ -154,8 +154,47 @@ fn color_to_argb(color: &str) -> String {
         "purple" => "0xFF, 0x80, 0x00, 0x80".to_string(),
         "teal" => "0xFF, 0x00, 0x80, 0x80".to_string(),
         "navy" => "0xFF, 0x00, 0x00, 0x80".to_string(),
+        "currentcolor" => "0xFF, 0x00, 0x00, 0x00".to_string(),
         _ => String::new(),
     }
+}
+
+/// 将 `color_to_argb` 产生的 `0xAA, 0xRR, 0xGG, 0xBB` 按元素 `opacity` / `fill-opacity` / `stroke-opacity` 缩放 alpha。
+fn color_to_argb_with_alpha(color: &str, alpha_scale: f32) -> String {
+    let base = color_to_argb(color);
+    if base.is_empty() {
+        return base;
+    }
+    let scale = alpha_scale.clamp(0.0, 1.0);
+    if (scale - 1.0).abs() <= 1e-4 {
+        return base;
+    }
+    let parts: Vec<&str> = base.split(',').map(str::trim).collect();
+    if parts.len() != 4 {
+        return base;
+    }
+    let a_raw = parts[0]
+        .strip_prefix("0x")
+        .or_else(|| parts[0].strip_prefix("0X"))
+        .and_then(|h| u8::from_str_radix(h, 16).ok())
+        .unwrap_or(255);
+    let a_scaled = ((a_raw as f32) * scale).round().clamp(0.0, 255.0) as u8;
+    format!("0x{:02X}, {}, {}, {}", a_scaled, parts[1], parts[2], parts[3])
+}
+
+/// 计算元素的有效绘制不透明度：`opacity * (fill-opacity 或 stroke-opacity)`。
+fn effective_svg_paint_opacity(
+    attributes: &std::collections::HashMap<String, Value>,
+    is_stroke: bool,
+) -> f32 {
+    let opacity = parse_attr_f32(attributes, "opacity", 1.0).clamp(0.0, 1.0);
+    let specific_key = if is_stroke {
+        "stroke-opacity"
+    } else {
+        "fill-opacity"
+    };
+    let specific = parse_attr_f32(attributes, specific_key, 1.0).clamp(0.0, 1.0);
+    opacity * specific
 }
 
 fn expand_nibble(c: &str) -> String {
@@ -348,9 +387,231 @@ fn resolve_svg_styles(
     }
 
     let mut out = attributes.clone();
-    for key in ["fill", "fill-rule"] {
+    for key in [
+        "fill",
+        "fill-rule",
+        "stroke",
+        "stroke-width",
+        "stroke-linecap",
+        "stroke-linejoin",
+        "opacity",
+        "fill-opacity",
+        "stroke-opacity",
+    ] {
         if let Some(v) = effective.get(key) {
             out.insert(key.to_string(), Value::from(v.as_str()));
+        }
+    }
+    out
+}
+
+const INHERITABLE_SVG_PRESENTATION_ATTRS: [&str; 9] = [
+    "fill",
+    "fill-rule",
+    "stroke",
+    "stroke-width",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "opacity",
+    "fill-opacity",
+    "stroke-opacity",
+];
+
+/// 将祖先（`<svg>` / `<g>`）的可继承样式属性与当前节点属性合并，并应用 CSS / inline `style` 及渐变色映射。
+fn resolve_svg_styles_with_inheritance(
+    stylesheet: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    gradient_colors: &std::collections::HashMap<String, String>,
+    inherited: &std::collections::HashMap<String, Value>,
+    attributes: &std::collections::HashMap<String, Value>,
+    tag: &str,
+) -> std::collections::HashMap<String, Value> {
+    let local_resolved = resolve_svg_styles(stylesheet, attributes, tag);
+    let mut merged = local_resolved.clone();
+    for key in INHERITABLE_SVG_PRESENTATION_ATTRS {
+        if !merged.contains_key(key) {
+            if let Some(parent_val) = inherited.get(key) {
+                merged.insert(key.to_string(), parent_val.clone());
+            }
+        } else if key == "opacity" {
+            if let Some(parent_val) = inherited.get("opacity") {
+                if let (Some(p), Some(c)) = (parse_dim(parent_val), merged.get("opacity").and_then(parse_dim)) {
+                    let combined = (p * c).clamp(0.0, 1.0);
+                    merged.insert("opacity".to_string(), Value::from(format!("{:.4}", combined)));
+                }
+            }
+        }
+    }
+    for paint_key in ["fill", "stroke"] {
+        if let Some(val) = merged.get(paint_key).map(|v| v.to_string()) {
+            if let Some(grad_id) = parse_svg_url_ref(&val) {
+                if let Some(resolved_color) = gradient_colors.get(&grad_id) {
+                    merged.insert(paint_key.to_string(), Value::from(resolved_color.as_str()));
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// 解析 ARGB 字符串 `0xAA, 0xRR, 0xGG, 0xBB` 为 `(a, r, g, b)`。
+fn parse_argb_quad(argb: &str) -> Option<(u8, u8, u8, u8)> {
+    let parts: Vec<&str> = argb.split(',').map(str::trim).collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let parse_hex = |s: &str| -> Option<u8> {
+        let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+        u8::from_str_radix(hex, 16).ok()
+    };
+    Some((
+        parse_hex(parts[0])?,
+        parse_hex(parts[1])?,
+        parse_hex(parts[2])?,
+        parse_hex(parts[3])?,
+    ))
+}
+
+/// 收集 SVG 中 `<linearGradient>` / `<radialGradient>` 的代表色。
+///
+/// - 若渐变包含显式 `stop-color`，对各 `<stop>` 的 RGB 取均值作为纯色近似（使 Chrome / Linux 等带渐变图标可转换）；
+/// - 若所有 `<stop>` 均未声明 `stop-color` 且含半透明 `stop-opacity < 1`（典型如投影/高光遮罩），映射为 `"none"` 跳过，避免变成纯黑实心块。
+fn collect_svg_gradient_colors(
+    events: &[Event],
+) -> std::collections::HashMap<String, String> {
+    #[derive(Clone)]
+    struct StopInfo {
+        color: Option<String>,
+        opacity: f32,
+    }
+    let mut raw_stops: std::collections::HashMap<String, Vec<StopInfo>> =
+        std::collections::HashMap::new();
+    let mut href_links: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut current_grad_id: Option<String> = None;
+
+    for event in events {
+        match event {
+            Event::Tag(name, t, attrs)
+                if name.eq_ignore_ascii_case("linearGradient")
+                    || name.eq_ignore_ascii_case("radialGradient") =>
+            {
+                match t {
+                    Type::Start | Type::Empty => {
+                        let id = attrs.get("id").map(|v| v.to_string()).unwrap_or_default();
+                        if !id.is_empty() {
+                            raw_stops.entry(id.clone()).or_default();
+                            if let Some(href) = svg_attr_href_value(attrs) {
+                                let target = href.trim().strip_prefix('#').unwrap_or(href.trim());
+                                if !target.is_empty() {
+                                    href_links.insert(id.clone(), target.to_string());
+                                }
+                            }
+                            if matches!(t, Type::Start) {
+                                current_grad_id = Some(id);
+                            }
+                        }
+                    }
+                    Type::End => {
+                        current_grad_id = None;
+                    }
+                }
+            }
+            Event::Tag(name, t, attrs)
+                if name.eq_ignore_ascii_case("stop")
+                    && matches!(t, Type::Start | Type::Empty) =>
+            {
+                if let Some(ref gid) = current_grad_id {
+                    let style_map = attrs
+                        .get("style")
+                        .map(|s| parse_inline_style_decls(&s.to_string()))
+                        .unwrap_or_default();
+                    let stop_color = style_map
+                        .get("stop-color")
+                        .cloned()
+                        .or_else(|| attrs.get("stop-color").map(|v| v.to_string()));
+                    let stop_opacity = style_map
+                        .get("stop-opacity")
+                        .and_then(|s| s.parse::<f32>().ok())
+                        .or_else(|| {
+                            attrs
+                                .get("stop-opacity")
+                                .and_then(parse_dim)
+                                .map(|d| d as f32)
+                        })
+                        .unwrap_or(1.0)
+                        .clamp(0.0, 1.0);
+                    raw_stops.entry(gid.clone()).or_default().push(StopInfo {
+                        color: stop_color,
+                        opacity: stop_opacity,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 解析 xlink:href 继承的 stops
+    let grad_ids: Vec<String> = raw_stops.keys().cloned().collect();
+    for id in &grad_ids {
+        if raw_stops.get(id).is_some_and(|v| v.is_empty()) {
+            let mut cur = id.as_str();
+            for _ in 0..8 {
+                if let Some(next) = href_links.get(cur) {
+                    if let Some(stops) = raw_stops.get(next) {
+                        if !stops.is_empty() {
+                            let cloned = stops.clone();
+                            raw_stops.insert(id.clone(), cloned);
+                            break;
+                        }
+                    }
+                    cur = next;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut out = std::collections::HashMap::new();
+    for (id, stops) in raw_stops {
+        if stops.is_empty() {
+            continue;
+        }
+        let any_explicit_color = stops.iter().any(|s| s.color.is_some());
+        let avg_opacity: f32 = stops.iter().map(|s| s.opacity).sum::<f32>() / (stops.len() as f32);
+        if !any_explicit_color && avg_opacity < 0.85 {
+            out.insert(id, "none".to_string());
+            continue;
+        }
+        let mut r_sum: u32 = 0;
+        let mut g_sum: u32 = 0;
+        let mut b_sum: u32 = 0;
+        let mut a_sum: u32 = 0;
+        let mut count: u32 = 0;
+        for stop in &stops {
+            let c_str = stop.color.as_deref().unwrap_or("#000000");
+            let argb = color_to_argb(c_str);
+            if let Some((a, r, g, b)) = parse_argb_quad(&argb) {
+                let eff_a = ((a as f32) * stop.opacity).round().clamp(0.0, 255.0) as u32;
+                r_sum += r as u32;
+                g_sum += g as u32;
+                b_sum += b as u32;
+                a_sum += eff_a;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            let r = (r_sum / count) as u8;
+            let g = (g_sum / count) as u8;
+            let b = (b_sum / count) as u8;
+            let a = (a_sum / count) as u8;
+            if a < 32 {
+                out.insert(id, "none".to_string());
+            } else if a == 255 {
+                out.insert(id, format!("#{:02X}{:02X}{:02X}", r, g, b));
+            } else {
+                out.insert(id, format!("#{:02X}{:02X}{:02X}{:02X}", r, g, b, a));
+            }
         }
     }
     out
@@ -370,14 +631,20 @@ fn is_svg_non_paint_subtree(tag: &str) -> bool {
         || tag.eq_ignore_ascii_case("symbol")
 }
 
-/// `fill` 视为「不向 Chromium 写入可见填充」：缺失 / `none` / 透明 / `currentColor`。
+/// `fill` 显式为 `none` 或 `transparent`（不含缺失或 `currentColor`）。
+fn svg_paint_fill_is_explicit_none(v: Option<&Value>) -> bool {
+    v.map(|x| {
+        let t = x.to_string().trim().to_ascii_lowercase();
+        t == "none" || t == "transparent"
+    })
+    .unwrap_or(false)
+}
+
+/// `fill` 视为「无显式填充颜色」：缺失 / `none` / 透明。
 fn svg_paint_fill_is_none_like(v: Option<&Value>) -> bool {
     v.map(|x| {
         let t = x.to_string().trim().to_ascii_lowercase();
-        t.is_empty()
-            || t == "none"
-            || t == "transparent"
-            || t == "currentcolor"
+        t.is_empty() || t == "none" || t == "transparent"
     })
     .unwrap_or(true)
 }
@@ -385,7 +652,7 @@ fn svg_paint_fill_is_none_like(v: Option<&Value>) -> bool {
 fn svg_paint_stroke_is_usable(v: Option<&Value>) -> bool {
     v.map(|x| {
         let t = x.to_string().trim().to_ascii_lowercase();
-        !t.is_empty() && t != "none" && t != "transparent" && t != "currentcolor"
+        !t.is_empty() && t != "none" && t != "transparent"
     })
     .unwrap_or(false)
 }
@@ -465,13 +732,16 @@ fn svg_href_points_to_raster_image(href: &str) -> bool {
         || s.ends_with(".bmp")
 }
 
-/// 转换前校验：拒绝位图头像/照片、pattern 平铺、渐变等无法矢量化的 SVG。
-fn validate_svg_vector_convertible(events: &[Event]) -> Result<(), String> {
+/// 转换前校验：拒绝位图头像/照片、pattern 平铺等无法矢量化的 SVG。
+fn validate_svg_vector_convertible(
+    events: &[Event],
+    gradient_colors: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
     let is_open_tag = |t: &Type| matches!(t, Type::Start | Type::Empty);
     let mut has_raster_image = false;
     let mut has_pattern = false;
-    let mut has_gradient = false;
-    let mut visible_paint_server_fill = false;
+    let mut has_unresolved_gradient = false;
+    let mut visible_pattern_fill = false;
 
     let mut non_paint_depth: usize = 0;
     for event in events {
@@ -480,11 +750,6 @@ fn validate_svg_vector_convertible(events: &[Event]) -> Result<(), String> {
                 if matches!(t, Type::Start | Type::Empty) {
                     if name.eq_ignore_ascii_case("pattern") {
                         has_pattern = true;
-                    }
-                    if name.eq_ignore_ascii_case("linearGradient")
-                        || name.eq_ignore_ascii_case("radialGradient")
-                    {
-                        has_gradient = true;
                     }
                     non_paint_depth += 1;
                 } else if matches!(t, Type::End) {
@@ -500,12 +765,21 @@ fn validate_svg_vector_convertible(events: &[Event]) -> Result<(), String> {
                     }
                 }
                 if non_paint_depth == 0
-                    && matches!(name.as_ref(), "path" | "rect" | "circle" | "ellipse")
+                    && matches!(&**name, "path" | "rect" | "circle" | "ellipse" | "polygon" | "polyline" | "line")
                 {
-                    if svg_paint_value_is_url_reference(attrs.get("fill"))
-                        || svg_paint_value_is_url_reference(attrs.get("stroke"))
-                    {
-                        visible_paint_server_fill = true;
+                    for key in ["fill", "stroke"] {
+                        if svg_paint_value_is_url_reference(attrs.get(key)) {
+                            let raw = attrs.get(key).map(|v| v.to_string()).unwrap_or_default();
+                            if let Some(id) = parse_svg_url_ref(&raw) {
+                                if !gradient_colors.contains_key(&id) {
+                                    if has_pattern {
+                                        visible_pattern_fill = true;
+                                    } else {
+                                        has_unresolved_gradient = true;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -520,16 +794,16 @@ fn validate_svg_vector_convertible(events: &[Event]) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if has_pattern && visible_paint_server_fill {
+    if has_pattern && visible_pattern_fill {
         return Err(
             "SVG 使用 pattern 平铺填充（如 Figma 导出的头像底图）。Chromium .icon 不支持 pattern，\
              无法保留位图内容；请改用纯色/描边的矢量图形。"
                 .to_string(),
         );
     }
-    if has_gradient && visible_paint_server_fill {
+    if has_unresolved_gradient {
         return Err(
-            "SVG 使用渐变填充（linearGradient/radialGradient）。Chromium .icon 不支持渐变，\
+            "SVG 使用了未解析的外部渐变或 paint server 引用。Chromium .icon 仅支持纯色或可解析的渐变，\
              请改为纯色或描边矢量。"
                 .to_string(),
         );
@@ -644,9 +918,9 @@ fn try_emit_open_stroked_polyline_as_chromium_stroke_commands(
     attributes: &std::collections::HashMap<String, Value>,
     write_new_path: bool,
     emit_path_colors: bool,
+    parent_transform: &Affine,
 ) -> Option<String> {
-    let d = attributes.get("d")?;
-    let data = Data::parse(&d.to_string()).ok()?;
+    let (data, scale) = parse_and_transform_svg_path_data(attributes, parent_transform)?;
     let contours = collect_open_polyline_contours_move_line_only(&data)?;
     if contours.len() != 1 {
         return None;
@@ -662,7 +936,8 @@ fn try_emit_open_stroked_polyline_as_chromium_stroke_commands(
     }
     if emit_path_colors {
         if let Some(st) = attributes.get("stroke") {
-            let color = color_to_argb(&st.to_string());
+            let alpha = effective_svg_paint_opacity(attributes, true);
+            let color = color_to_argb_with_alpha(&st.to_string(), alpha);
             if !color.is_empty() {
                 output.push_str(&format!("PATH_COLOR_ARGB, {},\r\n", color));
             }
@@ -670,7 +945,7 @@ fn try_emit_open_stroked_polyline_as_chromium_stroke_commands(
     }
     // 与通用 `handle_svg_path` 一致：SVG 路径默认 nonzero。
     output.push_str("FILL_RULE_NONZERO,\r\n");
-    let sw = parse_attr_f32(attributes, "stroke-width", 1.0);
+    let sw = parse_attr_f32(attributes, "stroke-width", 1.0) * scale;
     output.push_str(&format!("STROKE, {},\r\n", format_number(sw)));
     let (x0, y0) = verts[0];
     output.push_str(&format!(
@@ -685,7 +960,11 @@ fn try_emit_open_stroked_polyline_as_chromium_stroke_commands(
             format_number(*y)
         ));
     }
-    output.push_str("CLOSE,\r\n");
+    // 仅 2 个顶点的单条线段加 `CLOSE` 与既有测试及 Chromium 折线描边保持兼容；
+    // 3 个及以上顶点的开放折线（如对勾 `m9 10 2 2 4-4`、折角 `<`）不可加 `CLOSE`，否则会闭合成三角形。
+    if verts.len() == 2 {
+        output.push_str("CLOSE,\r\n");
+    }
     Some(output)
 }
 
@@ -737,7 +1016,7 @@ fn parse_dim(value: &Value) -> Option<f64> {
 fn parse_attr_f32(attrs: &std::collections::HashMap<String, Value>, key: &str, default: f32) -> f32 {
     attrs
         .get(key)
-        .and_then(|v| parse_dim(v))
+        .and_then(parse_dim)
         .map(|d| d as f32)
         .unwrap_or(default)
 }
@@ -772,6 +1051,25 @@ fn affine_mul(m1: &Affine, m2: &Affine) -> Affine {
 
 fn affine_apply(m: &Affine, x: f32, y: f32) -> (f32, f32) {
     (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
+}
+
+fn affine_is_identity(m: &Affine) -> bool {
+    (m[0] - 1.0).abs() <= 1e-5
+        && m[1].abs() <= 1e-5
+        && m[2].abs() <= 1e-5
+        && (m[3] - 1.0).abs() <= 1e-5
+        && m[4].abs() <= 1e-5
+        && m[5].abs() <= 1e-5
+}
+
+fn affine_is_axis_aligned_positive_scale(m: &Affine) -> bool {
+    m[1].abs() <= 1e-5 && m[2].abs() <= 1e-5 && m[0] > 0.0 && m[3] > 0.0
+}
+
+fn affine_uniform_scale(m: &Affine) -> f32 {
+    let sx = (m[0] * m[0] + m[1] * m[1]).sqrt();
+    let sy = (m[2] * m[2] + m[3] * m[3]).sqrt();
+    (sx + sy) * 0.5
 }
 
 /// 解析 SVG `transform` 属性为单个仿射矩阵；不支持的内容按恒等忽略。
@@ -1009,6 +1307,7 @@ fn handle_svg_rect(
     write_new_path: bool,
     emit_path_colors: bool,
     masks: &std::collections::HashMap<String, Vec<SvgMaskRect>>,
+    parent_transform: &Affine,
 ) -> String {
     let mut output = String::new();
 
@@ -1017,12 +1316,28 @@ fn handle_svg_rect(
     let mut y = geom.y;
     let mut width = geom.w;
     let mut height = geom.h;
-    let rx = geom.r;
+    let mut rx = geom.r;
 
-    let transform = attributes
+    let local_transform = attributes
         .get("transform")
         .map(|v| v.to_string())
-        .and_then(|s| parse_svg_transform(&s));
+        .and_then(|s| parse_svg_transform(&s))
+        .unwrap_or(AFFINE_IDENTITY);
+    let combined_transform = affine_mul(parent_transform, &local_transform);
+
+    let transform = if affine_is_identity(&combined_transform) {
+        None
+    } else if affine_is_axis_aligned_positive_scale(&combined_transform) {
+        let (nx, ny) = affine_apply(&combined_transform, x, y);
+        x = nx;
+        y = ny;
+        width *= combined_transform[0];
+        height *= combined_transform[3];
+        rx *= affine_uniform_scale(&combined_transform);
+        None
+    } else {
+        Some(combined_transform)
+    };
 
     // 描边矩形（`stroke=<实色>` 且 `fill:none`）必须画轮廓，而不是实心 `ROUND_RECT`：
     // 否则边框线宽会被当成实心面，外框退化成填满画布的实心块（表现为背景不透明、
@@ -1030,11 +1345,20 @@ fn handle_svg_rect(
     let stroked = svg_paint_fill_is_none_like(attributes.get("fill"))
         && svg_paint_stroke_is_usable(attributes.get("stroke"));
 
+    if !stroked && svg_paint_fill_is_explicit_none(attributes.get("fill")) {
+        return String::new();
+    }
+
     // pattern / 渐变等 paint server 填充无法写入 .icon；跳过以免生成无色的实心占位形（预览呈黑块/黑圆）。
     if !stroked
         && (svg_paint_value_is_url_reference(attributes.get("fill"))
             || svg_paint_value_is_url_reference(attributes.get("stroke")))
     {
+        return String::new();
+    }
+
+    let alpha = effective_svg_paint_opacity(attributes, stroked);
+    if !emit_path_colors && !stroked && alpha < 0.25 {
         return String::new();
     }
 
@@ -1059,16 +1383,20 @@ fn handle_svg_rect(
         output.push_str("NEW_PATH,\r\n");
     }
     if emit_path_colors {
-        let color_src = if stroked {
-            attributes.get("stroke")
+        let color_str = if stroked {
+            attributes
+                .get("stroke")
+                .map(|v| v.to_string())
+                .unwrap_or_default()
         } else {
-            attributes.get("fill")
+            attributes
+                .get("fill")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "#000000".to_string())
         };
-        if let Some(c) = color_src {
-            let color = color_to_argb(&c.to_string());
-            if !color.is_empty() {
-                output.push_str(&format!("PATH_COLOR_ARGB, {},\r\n", color));
-            }
+        let color = color_to_argb_with_alpha(&color_str, alpha);
+        if !color.is_empty() {
+            output.push_str(&format!("PATH_COLOR_ARGB, {},\r\n", color));
         }
     }
 
@@ -1077,7 +1405,8 @@ fn handle_svg_rect(
         output.push_str("FILL_RULE_NONZERO,\r\n");
         let sw = inside_mask
             .map(|adj| adj.stroke_width)
-            .unwrap_or_else(|| parse_attr_f32(attributes, "stroke-width", 1.0));
+            .unwrap_or_else(|| parse_attr_f32(attributes, "stroke-width", 1.0))
+            * affine_uniform_scale(&combined_transform);
         output.push_str(&format!("STROKE, {},\r\n", format_number(sw)));
     }
 
@@ -1147,7 +1476,8 @@ fn emit_chromium_filled_circle(
     cx: f32,
     cy: f32,
     r: f32,
-    fill: &Value,
+    fill: &str,
+    alpha: f32,
     write_new_path: bool,
     emit_path_colors: bool,
 ) -> String {
@@ -1156,7 +1486,7 @@ fn emit_chromium_filled_circle(
         output.push_str("NEW_PATH,\r\n");
     }
     if emit_path_colors {
-        let color = color_to_argb(&fill.to_string());
+        let color = color_to_argb_with_alpha(fill, alpha);
         if !color.is_empty() {
             output.push_str(&format!("PATH_COLOR_ARGB, {},\r\n", color));
         }
@@ -1208,15 +1538,17 @@ fn stroke_only_circle_as_evenodd_ring_path(
     cx: f32,
     cy: f32,
     r: f32,
+    scale: f32,
     write_new_path: bool,
     emit_path_colors: bool,
 ) -> Option<String> {
     let stroke = attributes.get("stroke")?;
-    let ts = stroke.to_string().trim().to_ascii_lowercase();
-    if ts.is_empty() || ts == "none" || ts == "transparent" || ts == "currentcolor" {
+    let stroke_str = stroke.to_string();
+    let ts = stroke_str.trim().to_ascii_lowercase();
+    if ts.is_empty() || ts == "none" || ts == "transparent" {
         return None;
     }
-    let sw = parse_attr_f32(attributes, "stroke-width", 1.0);
+    let sw = parse_attr_f32(attributes, "stroke-width", 1.0) * scale;
     if !(r > 0.0 && sw > 0.0) {
         return None;
     }
@@ -1225,13 +1557,15 @@ fn stroke_only_circle_as_evenodd_ring_path(
     const SEG: usize = 48;
     // 内径过小：描边盖住圆心，等价于实心外圆盘。
     const INNER_EPS: f32 = 2e-3;
+    let alpha = effective_svg_paint_opacity(attributes, true);
 
     if inner <= INNER_EPS {
         return Some(emit_chromium_filled_circle(
             cx,
             cy,
             outer,
-            stroke,
+            &stroke_str,
+            alpha,
             write_new_path,
             emit_path_colors,
         ));
@@ -1242,7 +1576,18 @@ fn stroke_only_circle_as_evenodd_ring_path(
     synth.insert("d".into(), Value::from(d));
     synth.insert("fill".into(), stroke.clone());
     synth.insert("fill-rule".into(), Value::from("evenodd"));
-    Some(handle_svg_path(&synth, write_new_path, emit_path_colors))
+    if let Some(op) = attributes.get("opacity") {
+        synth.insert("opacity".into(), op.clone());
+    }
+    if let Some(sop) = attributes.get("stroke-opacity") {
+        synth.insert("fill-opacity".into(), sop.clone());
+    }
+    Some(handle_svg_path(
+        &synth,
+        write_new_path,
+        emit_path_colors,
+        &AFFINE_IDENTITY,
+    ))
 }
 
 /// 把 SVG `<circle>` 转换为 Chromium `CIRCLE` 或（仅 `stroke`、无填充时）近似圆环路径。
@@ -1251,12 +1596,22 @@ fn handle_svg_circle(
     attributes: &std::collections::HashMap<String, Value>,
     write_new_path: bool,
     emit_path_colors: bool,
+    parent_transform: &Affine,
 ) -> String {
-    let cx = parse_attr_f32(attributes, "cx", 0.0);
-    let cy = parse_attr_f32(attributes, "cy", 0.0);
-    let r = parse_attr_f32(attributes, "r", 0.0);
+    let local_transform = attributes
+        .get("transform")
+        .map(|v| v.to_string())
+        .and_then(|s| parse_svg_transform(&s))
+        .unwrap_or(AFFINE_IDENTITY);
+    let m = affine_mul(parent_transform, &local_transform);
+    let scale = affine_uniform_scale(&m);
+    let raw_cx = parse_attr_f32(attributes, "cx", 0.0);
+    let raw_cy = parse_attr_f32(attributes, "cy", 0.0);
+    let (cx, cy) = affine_apply(&m, raw_cx, raw_cy);
+    let r = parse_attr_f32(attributes, "r", 0.0) * scale;
 
     let fill_none = svg_paint_fill_is_none_like(attributes.get("fill"));
+    let fill_explicit_none = svg_paint_fill_is_explicit_none(attributes.get("fill"));
     let stroke_ok = svg_paint_stroke_is_usable(attributes.get("stroke"));
 
     if fill_none && stroke_ok {
@@ -1265,6 +1620,7 @@ fn handle_svg_circle(
             cx,
             cy,
             r,
+            scale,
             write_new_path,
             emit_path_colors,
         ) {
@@ -1273,15 +1629,25 @@ fn handle_svg_circle(
         return String::new();
     }
 
-    if fill_none && !stroke_ok {
+    if fill_explicit_none && !stroke_ok {
         return String::new();
     }
+
+    let alpha = effective_svg_paint_opacity(attributes, false);
+    if !emit_path_colors && alpha < 0.25 {
+        return String::new();
+    }
+    let fill_str = attributes
+        .get("fill")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "#000000".to_string());
 
     emit_chromium_filled_circle(
         cx,
         cy,
         r,
-        attributes.get("fill").unwrap(),
+        &fill_str,
+        alpha,
         write_new_path,
         emit_path_colors,
     )
@@ -1293,23 +1659,46 @@ fn handle_svg_ellipse(
     attributes: &std::collections::HashMap<String, Value>,
     write_new_path: bool,
     emit_path_colors: bool,
+    parent_transform: &Affine,
 ) -> String {
     let mut output = String::new();
 
-    let cx = parse_attr_f32(attributes, "cx", 0.0);
-    let cy = parse_attr_f32(attributes, "cy", 0.0);
-    let rx = parse_attr_f32(attributes, "rx", 0.0);
-    let ry = parse_attr_f32(attributes, "ry", 0.0);
+    if svg_paint_fill_is_explicit_none(attributes.get("fill"))
+        && !svg_paint_stroke_is_usable(attributes.get("stroke"))
+    {
+        return output;
+    }
+
+    let local_transform = attributes
+        .get("transform")
+        .map(|v| v.to_string())
+        .and_then(|s| parse_svg_transform(&s))
+        .unwrap_or(AFFINE_IDENTITY);
+    let m = affine_mul(parent_transform, &local_transform);
+    let raw_cx = parse_attr_f32(attributes, "cx", 0.0);
+    let raw_cy = parse_attr_f32(attributes, "cy", 0.0);
+    let (cx, cy) = affine_apply(&m, raw_cx, raw_cy);
+    let sx = (m[0] * m[0] + m[1] * m[1]).sqrt();
+    let sy = (m[2] * m[2] + m[3] * m[3]).sqrt();
+    let rx = parse_attr_f32(attributes, "rx", 0.0) * sx;
+    let ry = parse_attr_f32(attributes, "ry", 0.0) * sy;
+
+    let alpha = effective_svg_paint_opacity(attributes, false);
+    if !emit_path_colors && alpha < 0.25 {
+        return output;
+    }
 
     if write_new_path {
         output.push_str("NEW_PATH,\r\n");
     }
     if emit_path_colors {
-        if let Some(fill) = attributes.get("fill") {
-            let color = color_to_argb(&fill.to_string());
-            if !color.is_empty() {
-                output.push_str(&format!("PATH_COLOR_ARGB, {},\r\n", color));
-            }
+        let fill_str = attributes
+            .get("fill")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "#000000".to_string());
+        let color = color_to_argb_with_alpha(&fill_str, alpha);
+        if !color.is_empty() {
+            output.push_str(&format!("PATH_COLOR_ARGB, {},\r\n", color));
         }
     }
     output.push_str(&format!(
@@ -1654,6 +2043,266 @@ fn append_chromium_path_commands_from_data(data: &Data, output: &mut String) {
     let _ = last_cubic_ctrl;
 }
 
+fn transform_svg_path_data(data: &Data, m: &Affine) -> Data {
+    if affine_is_identity(m) {
+        return data.clone();
+    }
+    let mut out = Data::new();
+    let mut pen = PenState::default();
+    let sx = (m[0] * m[0] + m[1] * m[1]).sqrt();
+    let sy = (m[2] * m[2] + m[3] * m[3]).sqrt();
+    let axis_aligned = m[1].abs() <= 1e-5 && m[2].abs() <= 1e-5;
+
+    for command in data.iter() {
+        match command {
+            Command::Move(position, params) => {
+                let mut idx = 0;
+                let mut first = true;
+                while idx + 1 < params.len() {
+                    let (ox, oy) = match position {
+                        Position::Absolute => (params[idx], params[idx + 1]),
+                        Position::Relative => {
+                            (pen.cur_x + params[idx], pen.cur_y + params[idx + 1])
+                        }
+                    };
+                    idx += 2;
+                    let (tx, ty) = affine_apply(m, ox, oy);
+                    if first {
+                        out = out.move_to((tx, ty));
+                        pen.move_abs(ox, oy);
+                        first = false;
+                    } else {
+                        out = out.line_to((tx, ty));
+                        pen.line_abs(ox, oy);
+                    }
+                }
+            }
+            Command::Line(position, params) => {
+                let mut idx = 0;
+                while idx + 1 < params.len() {
+                    let (ox, oy) = match position {
+                        Position::Absolute => (params[idx], params[idx + 1]),
+                        Position::Relative => {
+                            (pen.cur_x + params[idx], pen.cur_y + params[idx + 1])
+                        }
+                    };
+                    idx += 2;
+                    let (tx, ty) = affine_apply(m, ox, oy);
+                    out = out.line_to((tx, ty));
+                    pen.line_abs(ox, oy);
+                }
+            }
+            Command::HorizontalLine(position, params) => {
+                for &x in params.iter() {
+                    let ox = match position {
+                        Position::Absolute => x,
+                        Position::Relative => pen.cur_x + x,
+                    };
+                    let oy = pen.cur_y;
+                    let (tx, ty) = affine_apply(m, ox, oy);
+                    if axis_aligned {
+                        out = out.horizontal_line_to(tx);
+                    } else {
+                        out = out.line_to((tx, ty));
+                    }
+                    pen.line_abs(ox, oy);
+                }
+            }
+            Command::VerticalLine(position, params) => {
+                for &y in params.iter() {
+                    let ox = pen.cur_x;
+                    let oy = match position {
+                        Position::Absolute => y,
+                        Position::Relative => pen.cur_y + y,
+                    };
+                    let (tx, ty) = affine_apply(m, ox, oy);
+                    if axis_aligned {
+                        out = out.vertical_line_to(ty);
+                    } else {
+                        out = out.line_to((tx, ty));
+                    }
+                    pen.line_abs(ox, oy);
+                }
+            }
+            Command::QuadraticCurve(position, params) => {
+                let mut idx = 0;
+                while idx + 3 < params.len() {
+                    let (ox1, oy1, ox, oy) = match position {
+                        Position::Absolute => {
+                            (params[idx], params[idx + 1], params[idx + 2], params[idx + 3])
+                        }
+                        Position::Relative => (
+                            pen.cur_x + params[idx],
+                            pen.cur_y + params[idx + 1],
+                            pen.cur_x + params[idx + 2],
+                            pen.cur_y + params[idx + 3],
+                        ),
+                    };
+                    idx += 4;
+                    let (tx1, ty1) = affine_apply(m, ox1, oy1);
+                    let (tx, ty) = affine_apply(m, ox, oy);
+                    out = out.quadratic_curve_to((tx1, ty1, tx, ty));
+                    pen.line_abs(ox, oy);
+                }
+            }
+            Command::SmoothQuadraticCurve(position, params) => {
+                let mut idx = 0;
+                while idx + 1 < params.len() {
+                    let (ox, oy) = match position {
+                        Position::Absolute => (params[idx], params[idx + 1]),
+                        Position::Relative => {
+                            (pen.cur_x + params[idx], pen.cur_y + params[idx + 1])
+                        }
+                    };
+                    idx += 2;
+                    let (tx, ty) = affine_apply(m, ox, oy);
+                    out = out.smooth_quadratic_curve_to((tx, ty));
+                    pen.line_abs(ox, oy);
+                }
+            }
+            Command::CubicCurve(position, params) => {
+                let mut idx = 0;
+                while idx + 5 < params.len() {
+                    let (ox1, oy1, ox2, oy2, ox, oy) = match position {
+                        Position::Absolute => (
+                            params[idx],
+                            params[idx + 1],
+                            params[idx + 2],
+                            params[idx + 3],
+                            params[idx + 4],
+                            params[idx + 5],
+                        ),
+                        Position::Relative => (
+                            pen.cur_x + params[idx],
+                            pen.cur_y + params[idx + 1],
+                            pen.cur_x + params[idx + 2],
+                            pen.cur_y + params[idx + 3],
+                            pen.cur_x + params[idx + 4],
+                            pen.cur_y + params[idx + 5],
+                        ),
+                    };
+                    idx += 6;
+                    let (tx1, ty1) = affine_apply(m, ox1, oy1);
+                    let (tx2, ty2) = affine_apply(m, ox2, oy2);
+                    let (tx, ty) = affine_apply(m, ox, oy);
+                    out = out.cubic_curve_to((tx1, ty1, tx2, ty2, tx, ty));
+                    pen.line_abs(ox, oy);
+                }
+            }
+            Command::SmoothCubicCurve(position, params) => {
+                let mut idx = 0;
+                while idx + 3 < params.len() {
+                    let (ox2, oy2, ox, oy) = match position {
+                        Position::Absolute => {
+                            (params[idx], params[idx + 1], params[idx + 2], params[idx + 3])
+                        }
+                        Position::Relative => (
+                            pen.cur_x + params[idx],
+                            pen.cur_y + params[idx + 1],
+                            pen.cur_x + params[idx + 2],
+                            pen.cur_y + params[idx + 3],
+                        ),
+                    };
+                    idx += 4;
+                    let (tx2, ty2) = affine_apply(m, ox2, oy2);
+                    let (tx, ty) = affine_apply(m, ox, oy);
+                    out = out.smooth_cubic_curve_to((tx2, ty2, tx, ty));
+                    pen.line_abs(ox, oy);
+                }
+            }
+            Command::EllipticalArc(position, params) => {
+                let mut idx = 0;
+                while idx + 6 < params.len() {
+                    let (rx, ry, rot, large, sweep, raw_x, raw_y) = (
+                        params[idx],
+                        params[idx + 1],
+                        params[idx + 2],
+                        params[idx + 3],
+                        params[idx + 4],
+                        params[idx + 5],
+                        params[idx + 6],
+                    );
+                    idx += 7;
+                    let (ox, oy) = match position {
+                        Position::Absolute => (raw_x, raw_y),
+                        Position::Relative => (pen.cur_x + raw_x, pen.cur_y + raw_y),
+                    };
+                    let (tx, ty) = affine_apply(m, ox, oy);
+                    out = out.elliptical_arc_to((rx * sx, ry * sy, rot, large, sweep, tx, ty));
+                    pen.line_abs(ox, oy);
+                }
+            }
+            Command::Close => {
+                out = out.close();
+                pen.close();
+            }
+        }
+    }
+    out
+}
+
+fn parse_and_transform_svg_path_data(
+    attributes: &std::collections::HashMap<String, Value>,
+    parent_transform: &Affine,
+) -> Option<(Data, f32)> {
+    let d = attributes.get("d")?;
+    let parsed = Data::parse(&d.to_string()).ok()?;
+    let local_transform = attributes
+        .get("transform")
+        .map(|v| v.to_string())
+        .and_then(|s| parse_svg_transform(&s))
+        .unwrap_or(AFFINE_IDENTITY);
+    let m = affine_mul(parent_transform, &local_transform);
+    let scale = affine_uniform_scale(&m);
+    if affine_is_identity(&m) {
+        Some((parsed, 1.0))
+    } else {
+        Some((transform_svg_path_data(&parsed, &m), scale))
+    }
+}
+
+fn svg_points_to_path_d(points: &str, close: bool) -> Option<String> {
+    let nums: Vec<f32> = points
+        .split(|c: char| c.is_ascii_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<f32>().ok())
+        .collect();
+    if nums.len() < 4 {
+        return None;
+    }
+    let mut d = format!("M{} {}", format_number(nums[0]), format_number(nums[1]));
+    let mut i = 2;
+    while i + 1 < nums.len() {
+        d.push_str(&format!(
+            " L{} {}",
+            format_number(nums[i]),
+            format_number(nums[i + 1])
+        ));
+        i += 2;
+    }
+    if close {
+        d.push('Z');
+    }
+    Some(d)
+}
+
+fn svg_line_to_path_d(attrs: &std::collections::HashMap<String, Value>) -> Option<String> {
+    let x1 = parse_attr_f32(attrs, "x1", 0.0);
+    let y1 = parse_attr_f32(attrs, "y1", 0.0);
+    let x2 = parse_attr_f32(attrs, "x2", 0.0);
+    let y2 = parse_attr_f32(attrs, "y2", 0.0);
+    if (x1 - x2).abs() <= 1e-6 && (y1 - y2).abs() <= 1e-6 {
+        return None;
+    }
+    Some(format!(
+        "M{} {} L{} {}",
+        format_number(x1),
+        format_number(y1),
+        format_number(x2),
+        format_number(y2)
+    ))
+}
+
 /// `fill="none"` 且带 `stroke` 的 `<path>`，用 Chromium 原生 `STROKE` 表达描边。
 /// 支持开放折线、含曲线/弧的开放或闭合子路径（如空心五角星 `…Z`）。
 ///
@@ -1663,6 +2312,7 @@ fn try_emit_stroked_path_as_chromium_stroke_commands(
     attributes: &std::collections::HashMap<String, Value>,
     write_new_path: bool,
     emit_path_colors: bool,
+    parent_transform: &Affine,
 ) -> Option<String> {
     if !svg_paint_fill_is_none_like(attributes.get("fill")) {
         return None;
@@ -1670,10 +2320,9 @@ fn try_emit_stroked_path_as_chromium_stroke_commands(
     if !svg_paint_stroke_is_usable(attributes.get("stroke")) {
         return None;
     }
-    let d = attributes.get("d")?;
-    let parsed = Data::parse(&d.to_string()).ok()?;
+    let (parsed, scale) = parse_and_transform_svg_path_data(attributes, parent_transform)?;
     // 纯 M/L/H/V 开放折线由专用分支处理（含末尾 CLOSE）。
-    if collect_open_polyline_contours_move_line_only(&parsed).is_some()
+    if collect_open_polyline_contours_move_line_only(&parsed).is_some_and(|c| c.len() == 1)
         && !parsed.iter().any(|c| matches!(c, Command::Close))
     {
         return None;
@@ -1685,14 +2334,15 @@ fn try_emit_stroked_path_as_chromium_stroke_commands(
     }
     if emit_path_colors {
         if let Some(st) = attributes.get("stroke") {
-            let color = color_to_argb(&st.to_string());
+            let alpha = effective_svg_paint_opacity(attributes, true);
+            let color = color_to_argb_with_alpha(&st.to_string(), alpha);
             if !color.is_empty() {
                 output.push_str(&format!("PATH_COLOR_ARGB, {},\r\n", color));
             }
         }
     }
     output.push_str("FILL_RULE_NONZERO,\r\n");
-    let sw = parse_attr_f32(attributes, "stroke-width", 1.0);
+    let sw = parse_attr_f32(attributes, "stroke-width", 1.0) * scale;
     output.push_str(&format!("STROKE, {},\r\n", format_number(sw)));
     append_chromium_path_commands_from_data(&parsed, &mut output);
     Some(output)
@@ -1703,8 +2353,23 @@ fn handle_svg_path(
     attributes: &std::collections::HashMap<String, Value>,
     write_new_path: bool,
     emit_path_colors: bool,
+    parent_transform: &Affine,
 ) -> String {
     let mut output = String::new();
+
+    if svg_paint_fill_is_explicit_none(attributes.get("fill")) {
+        return output;
+    }
+
+    let alpha = effective_svg_paint_opacity(attributes, false);
+    if !emit_path_colors && alpha < 0.25 {
+        return output;
+    }
+
+    let (parsed, _) = match parse_and_transform_svg_path_data(attributes, parent_transform) {
+        Some(p) => p,
+        None => return output,
+    };
 
     if write_new_path {
         output.push_str("NEW_PATH,\r\n");
@@ -1712,24 +2377,12 @@ fn handle_svg_path(
 
     if emit_path_colors {
         if let Some(fill) = attributes.get("fill") {
-            let color = color_to_argb(&fill.to_string());
+            let color = color_to_argb_with_alpha(&fill.to_string(), alpha);
             if !color.is_empty() {
                 output.push_str(&format!("PATH_COLOR_ARGB, {},\r\n", color));
             }
         }
     }
-
-    let data = match attributes.get("d") {
-        Some(d) => d,
-        None => return output,
-    };
-    let parsed = match Data::parse(&data.to_string()) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("[chromium_icon] failed to parse path data: {}", e);
-            return output;
-        }
-    };
 
     append_chromium_fill_rule_for_filled_path(attributes, &parsed, &mut output);
     append_chromium_path_commands_from_data(&parsed, &mut output);
@@ -1793,7 +2446,8 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
         .map_err(|e| format!("Failed to open/parse SVG '{}': {}", svg_path, e))?
         .collect::<Vec<_>>();
 
-    validate_svg_vector_convertible(&events)?;
+    let gradient_colors = collect_svg_gradient_colors(&events);
+    validate_svg_vector_convertible(&events, &gradient_colors)?;
 
     let parent = Path::new(svg_path).parent().unwrap_or_else(|| Path::new("."));
     let dst = PathBuf::from(parent).join(output_path);
@@ -1905,25 +2559,110 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
         None
     });
 
+    // 祖先 `<svg>` / `<g>` 的可继承表现属性与累计变换（lucide 等图标把
+    // `fill="none" stroke="currentColor" stroke-width="2"` 写在根 `<svg>` 上）。
+    type StyleMap = std::collections::HashMap<String, Value>;
+    let mut ancestor_stack: Vec<(StyleMap, Affine)> = vec![(StyleMap::new(), AFFINE_IDENTITY)];
+
     let mut non_paint_depth: usize = 0;
     let mut emitted_path = false;
     for event in events.iter() {
+        // 维护祖先样式/变换栈（含非绘制子树内的 `<g>`，保证 Start/End 配对）。
+        if let Event::Tag(name, t, attributes) = event {
+            if *name == "svg" || *name == "g" {
+                match t {
+                    Type::Start => {
+                        let (parent_style, parent_m) = ancestor_stack
+                            .last()
+                            .cloned()
+                            .unwrap_or_else(|| (StyleMap::new(), AFFINE_IDENTITY));
+                        let resolved = resolve_svg_styles_with_inheritance(
+                            &stylesheet,
+                            &gradient_colors,
+                            &parent_style,
+                            attributes,
+                            name,
+                        );
+                        let mut inherited = StyleMap::new();
+                        for key in INHERITABLE_SVG_PRESENTATION_ATTRS {
+                            if let Some(v) = resolved.get(key) {
+                                inherited.insert(key.to_string(), v.clone());
+                            }
+                        }
+                        let local_m = if *name == "g" {
+                            attributes
+                                .get("transform")
+                                .map(|v| v.to_string())
+                                .and_then(|s| parse_svg_transform(&s))
+                                .unwrap_or(AFFINE_IDENTITY)
+                        } else {
+                            AFFINE_IDENTITY
+                        };
+                        ancestor_stack.push((inherited, affine_mul(&parent_m, &local_m)));
+                        continue;
+                    }
+                    Type::End => {
+                        if ancestor_stack.len() > 1 {
+                            ancestor_stack.pop();
+                        }
+                        continue;
+                    }
+                    Type::Empty => continue,
+                }
+            }
+        }
+
+        let (inherited_style, parent_m) = ancestor_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| (StyleMap::new(), AFFINE_IDENTITY));
+        let resolve = |attributes: &StyleMap, tag: &str| {
+            resolve_svg_styles_with_inheritance(
+                &stylesheet,
+                &gradient_colors,
+                &inherited_style,
+                attributes,
+                tag,
+            )
+        };
+
         match event {
             Event::Tag(name, t, _) if is_svg_non_paint_subtree(name) => match t {
                 Type::Start => non_paint_depth += 1,
                 Type::End => non_paint_depth = non_paint_depth.saturating_sub(1),
                 Type::Empty => {}
             },
-            Event::Tag("g", t, attributes) if is_open_tag(t) && non_paint_depth == 0 => {
-                if attributes.contains_key("transform") {
-                    eprintln!(
-                        "[chromium_icon] warning: <g transform=...> is not supported, \
-                         the transform will be ignored. Please flatten transforms in your SVG first."
-                    );
+            Event::Tag(tag @ ("path" | "line" | "polyline" | "polygon"), t, attributes)
+                if is_open_tag(t) && non_paint_depth == 0 =>
+            {
+                let mut resolved = resolve(attributes, tag);
+                // `<line>` / `<polyline>` / `<polygon>` 统一转为等价 path `d`。
+                match *tag {
+                    "line" => match svg_line_to_path_d(&resolved) {
+                        Some(d) => {
+                            resolved.insert("d".to_string(), Value::from(d));
+                        }
+                        None => continue,
+                    },
+                    "polyline" | "polygon" => {
+                        let pts = resolved
+                            .get("points")
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
+                        match svg_points_to_path_d(&pts, *tag == "polygon") {
+                            Some(d) => {
+                                resolved.insert("d".to_string(), Value::from(d));
+                            }
+                            None => continue,
+                        }
+                    }
+                    _ => {}
                 }
-            }
-            Event::Tag("path", t, attributes) if is_open_tag(t) && non_paint_depth == 0 => {
-                let mut resolved = resolve_svg_styles(&stylesheet, attributes, "path");
+                // `<line>` 永不填充。
+                if *tag == "line" {
+                    resolved.insert("fill".to_string(), Value::from("none"));
+                }
+
                 let stroke_only_glyph = svg_paint_fill_is_none_like(resolved.get("fill"))
                     && svg_paint_stroke_is_usable(resolved.get("stroke"));
 
@@ -1937,6 +2676,7 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
                                 &resolved,
                                 emitted_path,
                                 emit_path_colors,
+                                &parent_m,
                             )
                         {
                             write!(output_file, "{}", chunk)
@@ -1949,6 +2689,7 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
                         &resolved,
                         emitted_path,
                         emit_path_colors,
+                        &parent_m,
                     ) {
                         write!(output_file, "{}", chunk)
                             .map_err(|e| format!("Failed to write path: {}", e))?;
@@ -1962,8 +2703,11 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
                     continue;
                 }
 
+                if svg_paint_fill_is_explicit_none(resolved.get("fill")) {
+                    continue;
+                }
                 ensure_fill_for_chromium_vector_paint(&mut resolved, svg_root_fill.as_deref());
-                let data = handle_svg_path(&resolved, emitted_path, emit_path_colors);
+                let data = handle_svg_path(&resolved, emitted_path, emit_path_colors, &parent_m);
                 if !data.is_empty() {
                     write!(output_file, "{}", data)
                         .map_err(|e| format!("Failed to write path: {}", e))?;
@@ -1971,8 +2715,9 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
                 }
             }
             Event::Tag("circle", t, attributes) if is_open_tag(t) && non_paint_depth == 0 => {
-                let resolved = resolve_svg_styles(&stylesheet, attributes, "circle");
-                let data = handle_svg_circle(t, &resolved, emitted_path, emit_path_colors);
+                let resolved = resolve(attributes, "circle");
+                let data =
+                    handle_svg_circle(t, &resolved, emitted_path, emit_path_colors, &parent_m);
                 if !data.is_empty() {
                     write!(output_file, "{}", data)
                         .map_err(|e| format!("Failed to write circle: {}", e))?;
@@ -1980,11 +2725,18 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
                 }
             }
             Event::Tag("rect", t, attributes) if is_open_tag(t) && non_paint_depth == 0 => {
-                let resolved = resolve_svg_styles(&stylesheet, attributes, "rect");
+                let resolved = resolve(attributes, "rect");
                 if is_full_canvas_white_background_rect(&resolved, canvas_dimensions) {
                     continue;
                 }
-                let data = handle_svg_rect(t, &resolved, emitted_path, emit_path_colors, &svg_masks);
+                let data = handle_svg_rect(
+                    t,
+                    &resolved,
+                    emitted_path,
+                    emit_path_colors,
+                    &svg_masks,
+                    &parent_m,
+                );
                 if !data.is_empty() {
                     write!(output_file, "{}", data)
                         .map_err(|e| format!("Failed to write rect: {}", e))?;
@@ -1992,8 +2744,9 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
                 }
             }
             Event::Tag("ellipse", t, attributes) if is_open_tag(t) && non_paint_depth == 0 => {
-                let resolved = resolve_svg_styles(&stylesheet, attributes, "ellipse");
-                let data = handle_svg_ellipse(t, &resolved, emitted_path, emit_path_colors);
+                let resolved = resolve(attributes, "ellipse");
+                let data =
+                    handle_svg_ellipse(t, &resolved, emitted_path, emit_path_colors, &parent_m);
                 if !data.is_empty() {
                     write!(output_file, "{}", data)
                         .map_err(|e| format!("Failed to write ellipse: {}", e))?;
@@ -2122,6 +2875,7 @@ fn flush_icon_path_layer(
 ///
 /// 支持 `NEW_PATH` 多子路径、`CIRCLE` / `OVAL` / `ROUND_RECT` 与路径命令混合，
 /// 与正向 `handle_svg_*` 输出对齐，避免信封等形状在预览中丢失。
+#[allow(dead_code)]
 pub fn try_convert_chromium_icon_source_to_svg_markup(source: &str) -> Result<String, String> {
     try_convert_chromium_icon_source_to_svg_markup_with_backdrop(
         source,
@@ -2221,6 +2975,9 @@ pub fn try_convert_chromium_icon_source_to_svg_markup_with_backdrop(
                     &mut layers,
                 );
                 pen = PenState::default();
+                // Chromium `PaintPath`：每个 NEW_PATH 段都以全新的 evenodd 路径与模板色开始。
+                fill_rule = "evenodd".to_string();
+                fill_color = None;
             }
             "CIRCLE" => {
                 let stroke_snapshot = vector_stroke_width.take();
@@ -3486,5 +4243,63 @@ MOVE_TO, 0, 0,\nLINE_TO, 16, 0,\nLINE_TO, 16, 16,\nLINE_TO, 0, 16,\nCLOSE,\n";
 
         let resolved = resolve_svg_styles(&sheet, &attrs, "path");
         assert_eq!(resolved.get("fill").unwrap().to_string(), "#ff0000");
+    }
+
+    /// 手动校验：`ICON_VERIFY_DIR=… cargo test verify_dir_round_trip -- --ignored`
+    /// 把目录内全部 `.svg` 转成 `.icon`，并把「原图 / 反向预览」渲染成对比 PNG（`_compare.png`）。
+    #[test]
+    #[ignore]
+    fn verify_dir_round_trip() {
+        use resvg::tiny_skia::{Pixmap, PixmapPaint, Transform};
+        let dir = match std::env::var("ICON_VERIFY_DIR") {
+            Ok(d) => std::path::PathBuf::from(d),
+            Err(_) => return,
+        };
+        let mut svgs: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "svg"))
+            .filter(|p| !p.to_string_lossy().ends_with(".preview.svg"))
+            .collect();
+        svgs.sort();
+        let cell: u32 = std::env::var("ICON_VERIFY_CELL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(96);
+        let render = |markup: &str| -> Option<Pixmap> {
+            let tree = resvg::usvg::Tree::from_str(markup, &resvg::usvg::Options::default()).ok()?;
+            let size = tree.size();
+            let mut pm = Pixmap::new(cell, cell)?;
+            pm.fill(resvg::tiny_skia::Color::WHITE);
+            let s = (cell as f32 / size.width()).min(cell as f32 / size.height());
+            resvg::render(&tree, Transform::from_scale(s, s), &mut pm.as_mut());
+            Some(pm)
+        };
+        let n = svgs.len() as u32;
+        let cols: u32 = n.clamp(1, 9);
+        let rows = n.div_ceil(cols);
+        let mut sheet = Pixmap::new(cols * (cell + 8), rows * (2 * cell + 24)).unwrap();
+        sheet.fill(resvg::tiny_skia::Color::from_rgba8(200, 200, 200, 255));
+        for (i, svg) in svgs.iter().enumerate() {
+            let stem = svg.file_stem().unwrap().to_string_lossy().to_string();
+            let icon_name = format!("{}.icon", stem);
+            let x = (i as u32 % cols) as i32 * (cell as i32 + 8) + 4;
+            let y0 = (i as u32 / cols) as i32 * (2 * cell as i32 + 24) + 4;
+            let orig = std::fs::read_to_string(svg).unwrap();
+            if let Some(pm) = render(&orig) {
+                sheet.draw_pixmap(x, y0, pm.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+            }
+            match try_convert_svg_to_chromium_icon(svg.to_str().unwrap(), &icon_name) {
+                Ok(icon_path) => {
+                    let back = try_convert_chromium_icon_path_to_svg_markup(&icon_path).unwrap();
+                    if let Some(pm) = render(&back) {
+                        sheet.draw_pixmap(x, y0 + cell as i32 + 4, pm.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+                    }
+                    println!("[{}] {} ok", i, stem);
+                }
+                Err(e) => println!("[{}] {} FAILED: {}", i, stem, e),
+            }
+        }
+        sheet.save_png(dir.join("_compare.png")).unwrap();
     }
 }

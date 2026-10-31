@@ -169,7 +169,11 @@ async fn handle_socket(
                                 break;
                             }
                         }
-                        Err(_) => {
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!("WebSocket 客户端消息滞后，跳过 {} 条日志（任务 ID: {}）", skipped, task_id);
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             // 通道关闭
                             break;
                         }
@@ -207,12 +211,14 @@ async fn handle_socket(
         }
     });
     
-    // 等待任一任务完成
+    // 等待任一任务完成，并终止另一个后台任务防止任务泄漏
     tokio::select! {
         _ = &mut send_task => {
+            recv_task.abort();
             info!("发送任务完成，任务 ID: {}", task_id);
         }
         _ = &mut recv_task => {
+            send_task.abort();
             info!("接收任务完成，任务 ID: {}", task_id);
         }
     }

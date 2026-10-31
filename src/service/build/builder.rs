@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::process::Command;
+use tokio::process::Command;
 use anyhow::{Context, Result};
 use crate::config::AppConfig;
 use crate::model::build::BuildRequest;
@@ -172,6 +172,7 @@ impl ProjectBuilder {
             .arg(&gn_command)
             .current_dir(src_path)
             .output()
+            .await
             .context("Failed to execute gn gen")?;
         
         let duration = start_time.elapsed();

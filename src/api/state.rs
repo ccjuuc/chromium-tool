@@ -71,9 +71,26 @@ impl AppState {
             .clone()
     }
     
+    /// 根据服务器地址推断所属平台
+    pub fn infer_platform(&self, server: &str) -> String {
+        if self.config.server.macos.iter().any(|s| s == server) || server.contains("macos") {
+            "macos".to_string()
+        } else if self.config.server.windows.iter().any(|s| s == server) || server.contains("windows") {
+            "windows".to_string()
+        } else if self.config.server.linux.iter().any(|s| s == server) || server.contains("linux") {
+            "linux".to_string()
+        } else {
+            std::env::consts::OS.to_string()
+        }
+    }
+
     /// 启动下一个 pending 任务（用于任务完成后的自动排队）
     pub fn start_next_pending_task(self: Arc<Self>, server: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         Box::pin(async move {
+            // 获取服务器锁，避免并发唤醒同一个排队任务
+            let server_lock = self.get_server_lock(&server);
+            let _guard = server_lock.lock().await;
+
             let task_repo = match &self.task_repo {
                 Some(repo) => repo.clone(),
                 None => return,
@@ -88,6 +105,11 @@ impl AppState {
                 Some(service) => service.clone(),
                 None => return,
             };
+
+            // 如果该服务器上仍有正在运行的任务，则不重复启动
+            if task_repo.has_running_task_on_server(&server).await.unwrap_or(false) {
+                return;
+            }
             
             // 检查下一个 pending 任务（优先查找子任务，如果没有则查找单架构任务）
             let next_task_id = match task_repo.get_next_pending_child_task_on_server(server.as_str()).await {
@@ -110,47 +132,49 @@ impl AppState {
                             tracing::warn!("任务 #{} 已被标记为失败或取消，跳过启动", next_task_id);
                             return;
                         }
-                    // 构建 BuildRequest（需要从任务信息中恢复）
-                    // 注意：这里需要从 pkg_flag 或其他字段中恢复完整信息
-                    // 为了简化，我们只启动单个架构的任务
-                    if let Some(arch) = &next_task.architecture {
-                        let request = crate::model::build::BuildRequest {
-                            branch: next_task.branch_name.clone(),
-                            commit_id: if next_task.commit_id.is_empty() { None } else { Some(next_task.commit_id) },
-                            pkg_flag: next_task.pkg_flag.clone(),
-                            installer_format: next_task.installer_format.clone(),
-                            is_increment: next_task.is_increment,
-                            is_signed: next_task.is_signed,
-                            server: next_task.server.clone(),
-                            platform: "".to_string(), // 需要从配置中推断
-                            architectures: vec![arch.clone()],
-                            is_x64: arch == "x64" || arch == "x86",
-                            custom_args: None,
-                            is_update: false,
-                            emails: None,
-                        };
-                        
-                        // 在调用前克隆所有需要的值，确保 Send
-                        let task_manager = task_service.manager().clone();
-                        let build_service_clone = build_service.clone();
-                        let task_repo_clone = task_repo.clone();
-                        let app_state_clone = self.clone();
-                        
-                        // 使用 tokio::spawn 异步启动任务，避免阻塞
-                        tokio::spawn(async move {
-                            if let Err(e) = build_service_clone.start_pending_task(
-                                next_task_id,
-                                request,
-                                task_manager,
-                                task_repo_clone,
-                                Some(app_state_clone),
-                            ).await {
-                                tracing::error!("启动下一个排队任务 #{} 失败: {:?}", next_task_id, e);
-                            }
-                        });
-                    } else {
-                        tracing::warn!("⚠️  任务 #{} 没有架构信息，跳过启动", next_task_id);
-                    }
+                        if let Some(arch) = &next_task.architecture {
+                            // 优先从持久化的 request_json 恢复完整构建参数（保留 custom_args、is_update、emails、platform 等）
+                            let request = next_task
+                                .request_json
+                                .as_deref()
+                                .and_then(|json| serde_json::from_str::<crate::model::build::BuildRequest>(json).ok())
+                                .unwrap_or_else(|| crate::model::build::BuildRequest {
+                                    branch: next_task.branch_name.clone(),
+                                    commit_id: if next_task.commit_id.is_empty() { None } else { Some(next_task.commit_id) },
+                                    pkg_flag: next_task.pkg_flag.clone(),
+                                    installer_format: next_task.installer_format.clone(),
+                                    is_increment: next_task.is_increment,
+                                    is_signed: next_task.is_signed,
+                                    server: next_task.server.clone(),
+                                    platform: self.infer_platform(&next_task.server),
+                                    architectures: vec![arch.clone()],
+                                    is_x64: arch == "x64" || arch == "x86",
+                                    custom_args: None,
+                                    is_update: false,
+                                    emails: None,
+                                });
+                            
+                            // 在调用前克隆所有需要的值，确保 Send
+                            let task_manager = task_service.manager().clone();
+                            let build_service_clone = build_service.clone();
+                            let task_repo_clone = task_repo.clone();
+                            let app_state_clone = self.clone();
+                            
+                            // 使用 tokio::spawn 异步启动任务，避免阻塞
+                            tokio::spawn(async move {
+                                if let Err(e) = build_service_clone.start_pending_task(
+                                    next_task_id,
+                                    request,
+                                    task_manager,
+                                    task_repo_clone,
+                                    Some(app_state_clone),
+                                ).await {
+                                    tracing::error!("启动下一个排队任务 #{} 失败: {:?}", next_task_id, e);
+                                }
+                            });
+                        } else {
+                            tracing::warn!("⚠️  任务 #{} 没有架构信息，跳过启动", next_task_id);
+                        }
                     },
                     Err(e) => {
                         tracing::warn!("⚠️  无法获取任务 #{} 的信息: {}，可能已被删除，跳过启动", next_task_id, e);

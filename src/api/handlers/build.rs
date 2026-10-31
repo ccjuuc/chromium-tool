@@ -4,6 +4,7 @@ use axum::{
     response::{Html, IntoResponse},
     Json,
 };
+use validator::Validate;
 use crate::api::AppState;
 use crate::model::build::BuildRequest;
 
@@ -21,11 +22,25 @@ pub async fn build_package(
     State(state): State<AppState>,
     Json(request): Json<BuildRequest>,
 ) -> impl IntoResponse {
-    // 基本验证
+    // 基本验证与结构校验
     if request.branch.is_empty() || request.platform.is_empty() {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             "Branch and platform are required",
+        ).into_response();
+    }
+
+    if let Err(e) = request.validate() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("Validation failed: {}", e),
+        ).into_response();
+    }
+
+    if let Err(msg) = request.validate_shell_safety() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            msg,
         ).into_response();
     }
     
@@ -114,6 +129,7 @@ pub async fn build_package(
             parent_id: None,
             architecture: None,
             installer_format: request.installer_format.clone(),
+            request_json: serde_json::to_string(&request).ok(),
         };
         
         match task_repo.create(&parent_task).await {
@@ -150,6 +166,9 @@ pub async fn build_package(
         ).into_response();
     }
 
+    // 释放服务器锁后再触发队列消费者（start_next_pending_task 内部也会获取该锁）
+    drop(_guard);
+
     // 后续处理：根据 has_running 决定是否触发队列消费者
     if has_running {
         // 有任务运行，新任务已入队（Pending），直接返回排队信息
@@ -163,7 +182,6 @@ pub async fn build_package(
     } else {
         // 无任务运行，触发队列消费者启动下一个 Pending 任务（即刚才创建的第一个，或者更早的）
         let app_state = Arc::new(state.clone());
-        // start_next_pending_task 是异步的，我们等待它启动（或者 spawn 也可以，但 await 更稳妥确保触发）
         app_state.start_next_pending_task(server_name).await;
         
         let msg = if request.architectures.len() == 1 {

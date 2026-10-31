@@ -29,10 +29,8 @@ impl TaskManager {
         F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         // 在获取 permit 之前就更新/插入任务，确保 cancel_task 可以找到它
-        // 更新已存在的任务（如果已通过 create_cancelled_flag 预注册）或插入新任务
         if let Some(mut task) = self.tasks.get_mut(&task_id) {
             task.cancelled = cancelled_flag.clone();
-            // handle 稍后设置
         } else {
             self.tasks.insert(task_id, TaskHandle {
                 state: TaskState::StartBuild,
@@ -41,28 +39,36 @@ impl TaskManager {
             });
         }
         
-        // 现在获取 permit（可能会等待，但任务已经在 TaskManager 中，可以被取消）
-        let _permit = self.semaphore.acquire().await?;
-        
-        // 再次检查取消标志（可能在等待 permit 期间被取消了）
-        if cancelled_flag.load(Ordering::Relaxed) {
-            tracing::warn!("⚠️  任务 #{} 在获取 permit 期间被取消，停止启动", task_id);
-            eprintln!("⚠️  任务 #{} 在获取 permit 期间被取消，停止启动", task_id);
-            return Err(anyhow::anyhow!("Task cancelled before start"));
-        }
-        
+        let semaphore_clone = self.semaphore.clone();
         let tasks_clone = self.tasks.clone();
         let handle = tokio::spawn(async move {
+            // 在异步任务内部持有 OwnedSemaphorePermit，直到任务执行完毕才释放
+            let _permit = match semaphore_clone.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(e) => {
+                    tracing::error!("Failed to acquire semaphore permit for task {}: {:?}", task_id, e);
+                    tasks_clone.remove(&task_id);
+                    return;
+                }
+            };
+
+            if cancelled_flag.load(Ordering::SeqCst) {
+                tracing::warn!("⚠️  任务 #{} 在获取 permit 期间被取消，停止启动", task_id);
+                tasks_clone.remove(&task_id);
+                return;
+            }
+
             if let Err(e) = f.await {
                 tracing::error!("Task {} failed: {:?}", task_id, e);
                 if let Some(mut task) = tasks_clone.get_mut(&task_id) {
                     task.state = TaskState::Failed;
                 }
-            } else {
-                if let Some(mut task) = tasks_clone.get_mut(&task_id) {
-                    task.state = TaskState::Success;
-                }
+            } else if let Some(mut task) = tasks_clone.get_mut(&task_id) {
+                task.state = TaskState::Success;
             }
+
+            // 任务执行结束后从活跃任务表中移除，避免内存泄漏
+            tasks_clone.remove(&task_id);
         });
         
         // 更新任务的 handle
@@ -111,14 +117,14 @@ impl TaskManager {
         
         // 设置取消标志（不立即移除任务，让取消标志能够被检查）
         if let Some(task) = self.tasks.get(&task_id) {
-            task.cancelled.store(true, Ordering::Relaxed);
+            task.cancelled.store(true, Ordering::SeqCst);
         } else {
             tracing::warn!("任务 #{} 不在 TaskManager 中", task_id);
             return Err(anyhow::anyhow!("Task {} not found in TaskManager", task_id));
         }
         
-        // 等待一小段时间，让取消标志生效
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // 等待一小段时间，让子进程清理逻辑检测取消标志并终止进程组
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         
         // 终止异步任务
         if let Some((_, task)) = self.tasks.remove(&task_id) {

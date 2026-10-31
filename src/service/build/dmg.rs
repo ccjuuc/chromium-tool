@@ -2,7 +2,7 @@
 // `#[cfg(target_os = "macos")]` gate 掉了。`appdmg-rs` 是 macOS 专属依赖，
 // 因此 `use` 也必须 gate，否则在 Windows / Linux 上会找不到 crate。
 #[cfg(target_os = "macos")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 #[cfg(target_os = "macos")]
 use anyhow::{Context, Result};
 #[cfg(target_os = "macos")]
@@ -136,7 +136,6 @@ fn create_background(out_path: &Path) -> Result<()> {
     let arrow_paths = vec![
         std::path::PathBuf::from("resources/dmg_arrow.png"), 
         std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("resources/dmg_arrow.png"))).unwrap_or_default(),
-         std::path::PathBuf::from("/Users/ext.shangzhijie1/chromium_tool/resources/dmg_arrow.png"),
     ];
 
     let (arrow_x, arrow_y) = (330u32, 190u32);

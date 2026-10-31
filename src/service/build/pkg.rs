@@ -2,7 +2,7 @@ use std::path::Path;
 use anyhow::{Result, Context};
 use crate::service::build::installer::InstallerBuilder;
 use tokio::fs;
-use std::process::Command;
+use tokio::process::Command;
 
 #[cfg(target_os = "macos")]
 pub async fn create(builder: &InstallerBuilder, src_path: &Path, out_dir: &str) -> Result<()> {
@@ -50,6 +50,7 @@ pub async fn create(builder: &InstallerBuilder, src_path: &Path, out_dir: &str) 
         .arg(&app_path)
         .arg(&temp_app_path)
         .output()
+        .await
         .context("Failed to execute ditto")?;
     
     if !ditto_output.status.success() {
@@ -102,6 +103,7 @@ pub async fn create(builder: &InstallerBuilder, src_path: &Path, out_dir: &str) 
         .arg("recommended")
         .arg(&pkg_path)
         .output()
+        .await
         .context("Failed to execute pkgbuild")?;
     
     // 清理临时文件
