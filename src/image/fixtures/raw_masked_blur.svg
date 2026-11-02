@@ -1,0 +1,39 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect width="1024" height="1024" rx="256" fill="white"/>
+<path d="M767.95 310.857C626.593 457.143 397.407 457.143 256.049 310.857" stroke-width="101.119" stroke-linecap="round" stroke="#222222"/>
+<path d="M767.95 713.143C626.593 566.857 397.407 566.857 256.049 713.143" stroke-width="101.119" stroke-linecap="round" stroke="#222222"/>
+<foreignObject x="275.199" y="258.589" width="473.956" height="507.119"><div xmlns="http://www.w3.org/1999/xhtml" style="backdrop-filter:blur(12.64px);clip-path:url(#bgblur_0_118_93_clip_path);height:100%;width:100%"></div></foreignObject><path data-figma-bg-blur-radius="25.2797" d="M723.724 283.869C600.348 397.237 423.693 397.237 300.479 283.929C443.276 437.782 442.73 587.761 300.522 740.054C423.642 626.645 600.275 626.645 723.876 740.428C582.901 586.4 583.149 438.269 723.724 283.869Z" fill="url(#paint0_radial_118_93)"/>
+<mask id="mask0_118_93" style="mask-type:alpha" maskUnits="userSpaceOnUse" x="300" y="283" width="424" height="458">
+<foreignObject x="275.199" y="258.589" width="473.956" height="507.119"><div xmlns="http://www.w3.org/1999/xhtml" style="backdrop-filter:blur(12.64px);clip-path:url(#bgblur_1_118_93_clip_path);height:100%;width:100%"></div></foreignObject><path data-figma-bg-blur-radius="25.2797" d="M723.724 283.869C600.348 397.237 423.693 397.237 300.479 283.929C443.276 437.782 442.73 587.761 300.522 740.054C423.642 626.645 600.275 626.645 723.876 740.428C582.901 586.4 583.149 438.269 723.724 283.869Z" fill="url(#paint1_radial_118_93)"/>
+</mask>
+<g mask="url(#mask0_118_93)">
+<g filter="url(#filter1_f_118_93)">
+<ellipse cx="512" cy="265.143" rx="194.169" ry="118.857" fill="#70ABFF"/>
+</g>
+<g filter="url(#filter2_f_118_93)">
+<ellipse cx="512" cy="758.857" rx="194.169" ry="118.857" fill="#6AE6FF"/>
+</g>
+</g>
+<defs>
+<clipPath id="bgblur_0_118_93_clip_path" transform="translate(-275.199 -258.589)"><path d="M723.724 283.869C600.348 397.237 423.693 397.237 300.479 283.929C443.276 437.782 442.73 587.761 300.522 740.054C423.642 626.645 600.275 626.645 723.876 740.428C582.901 586.4 583.149 438.269 723.724 283.869Z"/>
+</clipPath><clipPath id="bgblur_1_118_93_clip_path" transform="translate(-275.199 -258.589)"><path d="M723.724 283.869C600.348 397.237 423.693 397.237 300.479 283.929C443.276 437.782 442.73 587.761 300.522 740.054C423.642 626.645 600.275 626.645 723.876 740.428C582.901 586.4 583.149 438.269 723.724 283.869Z"/>
+</clipPath><filter id="filter1_f_118_93" x="134.973" y="-36.5715" width="754.053" height="603.429" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+<feGaussianBlur stdDeviation="91.4286" result="effect1_foregroundBlur_118_93"/>
+</filter>
+<filter id="filter2_f_118_93" x="134.973" y="457.143" width="754.053" height="603.428" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+<feFlood flood-opacity="0" result="BackgroundImageFix"/>
+<feBlend mode="normal" in="SourceGraphic" in2="BackgroundImageFix" result="shape"/>
+<feGaussianBlur stdDeviation="91.4286" result="effect1_foregroundBlur_118_93"/>
+</filter>
+<radialGradient id="paint0_radial_118_93" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(507.349 502.468) rotate(90) scale(198.796 755.543)">
+<stop stop-color="white" stop-opacity="0.8"/>
+<stop offset="1" stop-color="#55CCFF" stop-opacity="0.8"/>
+</radialGradient>
+<radialGradient id="paint1_radial_118_93" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(507.349 502.468) rotate(90) scale(198.796 755.543)">
+<stop stop-color="white" stop-opacity="0.8"/>
+<stop offset="1" stop-color="#55CCFF" stop-opacity="0.8"/>
+</radialGradient>
+</defs>
+</svg>

@@ -280,24 +280,25 @@ pub fn generate_chromium_icns(fpath: &str, out_path: &str, border: bool) -> Stri
         None
     };
 
-    let sizes = vec![512, 256, 128, 64, 32, 16];
+    // Match Chromium's makeicns2 convention. PNG-in-icp4/icp5/icp6 can
+    // scramble small icons on macOS; legacy RGB entries include a separate
+    // alpha mask. There is no legacy 64px slot, so omit that representation.
+    // https://chromium.googlesource.com/chromium/src/+/main/docs/mac/icons.md
+    let representations = [
+        (512, IconType::RGBA32_512x512),
+        (256, IconType::RGBA32_256x256),
+        (128, IconType::RGB24_128x128),
+        (32, IconType::RGB24_32x32),
+        (16, IconType::RGB24_16x16),
+    ];
     let mut icon_family = IconFamily::new();
 
-    for size in sizes {
+    for (size, icon_type) in representations {
         let resized_img = resize_image_with_scaler(fix_path.to_str().unwrap(), None, size, size);
         if let Some(resized_img) = resized_img {
-            let rgba32f = resized_img.to_rgba32f();
-            let rgba: Vec<u8> = rgba32f.iter().map(|&f| (f * 255.0) as u8).collect();
-            let icns_image = IcnsImage::from_data(icns::PixelFormat::RGBA, size as u32, size as u32, rgba).expect("Failed to create icns image");
-            let icon_type = match size {
-                512 => IconType::RGBA32_512x512,
-                256 => IconType::RGBA32_256x256,
-                128 => IconType::RGBA32_128x128,
-                64 => IconType::RGBA32_64x64,
-                32 => IconType::RGBA32_32x32,
-                16 => IconType::RGBA32_16x16,
-                _ => continue,
-            };
+            let rgba = resized_img.to_rgba8().into_raw();
+            let icns_image = IcnsImage::from_data(icns::PixelFormat::RGBA, size, size, rgba).expect("Failed to create icns image");
+            // add_icon_with_type writes s8mk/l8mk/t8mk along with legacy RGB.
             icon_family.add_icon_with_type(&icns_image, icon_type).expect("Failed to add icon");
         }
     }
@@ -384,5 +385,67 @@ pub fn generate_grayscale_image(fpath: &str, out_path: &str, size: u32) {
         let mut output_path = PathBuf::from(input_path.parent().unwrap());
         output_path.push(out_path);
         DynamicImage::ImageLumaA8(grayscale_img).save(&output_path).expect("Failed to save image");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chromium_icns_uses_legacy_small_icons_and_preserves_rgba() {
+        let directory = std::env::temp_dir().join(format!(
+            "chromium_icns_encoding_{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.png");
+        let pixels = ImageBuffer::from_fn(512, 512, |x, y| {
+            Rgba([x as u8, y as u8, (x ^ y) as u8, [0, 64, 128, 255][(x / 128) as usize]])
+        });
+        pixels.save(&source).unwrap();
+
+        for border in [false, true] {
+            let output = generate_chromium_icns(source.to_str().unwrap(), "test.icns", border);
+            let bytes = std::fs::read(output).unwrap();
+            assert_eq!(&bytes[..4], b"icns");
+            assert_eq!(u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize, bytes.len());
+            let family = IconFamily::read(std::io::Cursor::new(&bytes)).unwrap();
+            let codes: Vec<_> = family.elements.iter().map(|element| element.ostype.0).collect();
+            assert_eq!(codes, [*b"ic09", *b"ic08", *b"it32", *b"t8mk", *b"il32", *b"l8mk", *b"is32", *b"s8mk"]);
+
+            for (size, kind, mask) in [
+                (16, IconType::RGB24_16x16, Some(IconType::Mask8_16x16)),
+                (32, IconType::RGB24_32x32, Some(IconType::Mask8_32x32)),
+                (128, IconType::RGB24_128x128, Some(IconType::Mask8_128x128)),
+                (256, IconType::RGBA32_256x256, None),
+                (512, IconType::RGBA32_512x512, None),
+            ] {
+                let decoded = family.get_icon_with_type(kind).unwrap().convert_to(icns::PixelFormat::RGBA);
+                assert_eq!((decoded.width(), decoded.height()), (size, size));
+                let element = family.elements.iter().find(|element| element.ostype == kind.ostype()).unwrap();
+                if let Some(mask) = mask {
+                    assert!(!element.data.starts_with(b"\x89PNG\r\n\x1a\n"));
+                    let mask_data = &family.elements.iter().find(|element| element.ostype == mask.ostype()).unwrap().data;
+                    let alpha: Vec<_> = decoded.data().chunks_exact(4).map(|pixel| pixel[3]).collect();
+                    assert_eq!(mask_data, &alpha);
+                    assert_eq!(mask_data.len(), (size * size) as usize);
+                    if size == 128 {
+                        assert_eq!(&element.data[..4], &[0, 0, 0, 0], "it32 requires the legacy prefix");
+                    }
+                } else {
+                    assert!(element.data.starts_with(b"\x89PNG\r\n\x1a\n"));
+                }
+                if border {
+                    // Lanczos may leave a one-level alpha fringe after downsampling.
+                    assert!(decoded.data()[((size - 1) * 4 + 3) as usize] <= 2, "app icon padding must remain transparent");
+                    assert!(decoded.data()[((size / 2 * size + size / 2) * 4 + 3) as usize] > 0);
+                } else {
+                    let expected = resize_image_with_scaler(source.to_str().unwrap(), None, size, size).unwrap().to_rgba8();
+                    assert_eq!(decoded.data(), expected.as_raw(), "RGBA mismatch at {}px", size);
+                }
+            }
+        }
+        assert!(!directory.join("tmp_app.png").exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

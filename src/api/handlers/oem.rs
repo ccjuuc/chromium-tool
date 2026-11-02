@@ -233,17 +233,7 @@ pub async fn select_icon_preview_directory(
         .initial_directory
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let selected = match tokio::task::spawn_blocking(move || {
-        let mut dialog = rfd::FileDialog::new().set_title("选择 .icon 工作目录");
-        if let Some(path) = initial {
-            if std::path::Path::new(&path).is_dir() {
-                dialog = dialog.set_directory(path);
-            }
-        }
-        dialog.pick_folder()
-    })
-    .await
-    {
+    let selected = match super::directory_picker::pick_directory(initial).await {
         Ok(path) => path,
         Err(e) => {
             return (

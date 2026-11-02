@@ -237,6 +237,7 @@
             </div>
             <p class="hint">
                 工作目录可直接填写、从历史中选择，或点「选择目录…」。最近使用的 10 个目录保存在当前浏览器中。点「SVG 全部 → .icon」会枚举该目录下所有 <code>.svg</code>，在同目录生成 <code>.icon</code>。取消勾选「写入 PATH_COLOR」时生成的 <code>.icon</code> 不含颜色行。
+                含遮罩或模糊的 SVG 会近似保留效果，生成文件可能较大；彩色模式保留原图背景，取消颜色后输出透明背景的单色轮廓。
             </p>
             <p id="dirPath" aria-live="polite"></p>
         </div>
@@ -273,6 +274,8 @@
             var currentOriginalsMap = {};
             var historyStorageKey = 'iconPreviewDirectoryHistory';
             var emitPathColorsStorageKey = 'iconPreviewEmitPathColors';
+            var batchConversionDirectory = '';
+            var batchConversionErrors = Object.create(null);
 
             function restoreEmitPathColors() {
                 try {
@@ -440,23 +443,32 @@
                     convCell.className = 'preview-cell conv-cell ' + bg;
                     convCell.style.width = px + 'px';
                     convCell.style.height = px + 'px';
-                    var convImg = document.createElement('img');
-                    convImg.className = 'preview-img conv-img';
-                    convImg.width = px;
-                    convImg.height = px;
-                    convImg.src = svgUrl(name);
-                    convImg.loading = 'lazy';
-                    convImg.alt = '';
-                    convImg.setAttribute('data-icon-name', name);
-                    convImg.setAttribute('aria-label', name);
-                    convImg.title = '转换后: ' + name;
-                    convImg.onerror = function () {
-                        convImg.alt = '!';
-                        convImg.style.background = 'rgba(220,220,230,.95)';
-                        convImg.style.minWidth = px + 'px';
-                        convImg.style.minHeight = px + 'px';
-                    };
-                    convCell.appendChild(convImg);
+                    var conversionError = batchConversionErrors[name];
+                    if (conversionError) {
+                        var failure = document.createElement('span');
+                        failure.className = 'preview-missing';
+                        failure.textContent = '转换失败';
+                        failure.title = conversionError.message;
+                        convCell.appendChild(failure);
+                    } else {
+                        var convImg = document.createElement('img');
+                        convImg.className = 'preview-img conv-img';
+                        convImg.width = px;
+                        convImg.height = px;
+                        convImg.src = svgUrl(name);
+                        convImg.loading = 'lazy';
+                        convImg.alt = '';
+                        convImg.setAttribute('data-icon-name', name);
+                        convImg.setAttribute('aria-label', name);
+                        convImg.title = '转换后: ' + name;
+                        convImg.onerror = function () {
+                            convImg.alt = '!';
+                            convImg.style.background = 'rgba(220,220,230,.95)';
+                            convImg.style.minWidth = px + 'px';
+                            convImg.style.minHeight = px + 'px';
+                        };
+                        convCell.appendChild(convImg);
+                    }
                     col.appendChild(convCell);
 
                     var caption = document.createElement('div');
@@ -519,6 +531,12 @@
                     if (!res.ok) {
                         throw new Error(raw || ('HTTP ' + res.status));
                     }
+                    batchConversionDirectory = data.directory || trimmed;
+                    batchConversionErrors = Object.create(null);
+                    (data.errors || []).forEach(function (error) {
+                        var iconName = error.file.replace(/\.svg$/i, '.icon');
+                        batchConversionErrors[iconName] = error;
+                    });
                     batchSummary.textContent = data.summary || '';
                     if (data.errors && data.errors.length) {
                         batchSummary.textContent +=
@@ -553,19 +571,29 @@
                     if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text().catch(function () { return ''; })));
                     var data = await res.json();
                     canonicalRootForQuery = ((data.directory || '') + '').trim();
+                    if (canonicalRootForQuery !== batchConversionDirectory) {
+                        batchConversionErrors = Object.create(null);
+                        batchConversionDirectory = '';
+                    }
                     if (canonicalRootForQuery) {
                         scanRootInput.value = canonicalRootForQuery;
                         rememberDirectory(canonicalRootForQuery);
                     }
                     dirPath.textContent = data.directory ? '当前目录：' + data.directory : '';
-                    var icons = data.icons || [];
+                    var icons = (data.icons || []).slice();
+                    var originals = data.originals || {};
+                    Object.keys(batchConversionErrors).forEach(function (name) {
+                        if (icons.indexOf(name) === -1) icons.push(name);
+                        originals[name] = batchConversionErrors[name].file;
+                    });
+                    icons.sort();
                     if (icons.length === 0) {
                         previewLegend.hidden = true;
                         emptyEl.hidden = false;
                         return;
                     }
                     emptyEl.hidden = true;
-                    render(icons, data.originals || {});
+                    render(icons, originals);
                 } catch (e) {
                     loadErr.textContent = '加载列表失败：' + e.message;
                     loadErr.hidden = false;

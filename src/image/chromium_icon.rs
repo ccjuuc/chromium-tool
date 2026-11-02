@@ -8,6 +8,9 @@ use svg::node::Value;
 use svg::parser::Event;
 use svg::Document;
 
+#[path = "chromium_icon_effects.rs"]
+mod effects;
+
 // ===========================================================================
 //
 // 本文件实现 SVG <-> Chromium `.icon` 文件之间的双向转换。
@@ -397,6 +400,8 @@ fn resolve_svg_styles(
         "opacity",
         "fill-opacity",
         "stroke-opacity",
+        "mask",
+        "filter",
     ] {
         if let Some(v) = effective.get(key) {
             out.insert(key.to_string(), Value::from(v.as_str()));
@@ -732,32 +737,69 @@ fn svg_href_points_to_raster_image(href: &str) -> bool {
         || s.ends_with(".bmp")
 }
 
-/// 转换前校验：拒绝位图头像/照片、pattern 平铺等无法矢量化的 SVG。
+#[derive(Debug, PartialEq, Eq)]
+enum SvgConversionMode {
+    Vector,
+    FlattenEffects,
+}
+
+/// 位图/pattern 仍需明确报错；遮罩和滤镜交给效果展开，不能直接丢弃。
 fn validate_svg_vector_convertible(
     events: &[Event],
     gradient_colors: &std::collections::HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<SvgConversionMode, String> {
     let is_open_tag = |t: &Type| matches!(t, Type::Start | Type::Empty);
     let mut has_raster_image = false;
-    let mut has_pattern = false;
     let mut has_unresolved_gradient = false;
     let mut visible_pattern_fill = false;
+    let mut needs_effect_flattening = false;
+    let stylesheet = collect_svg_stylesheet(events);
+    let masks = collect_svg_mask_rects(events);
+    let pattern_ids: std::collections::HashSet<String> = events.iter().filter_map(|event| {
+        if let Event::Tag("pattern", Type::Start | Type::Empty, attrs) = event {
+            attrs.get("id").map(|id| id.to_string())
+        } else {
+            None
+        }
+    }).collect();
+    let mut ancestor_styles = vec![std::collections::HashMap::new()];
 
     let mut non_paint_depth: usize = 0;
     for event in events {
         match event {
             Event::Tag(name, t, _) if is_svg_non_paint_subtree(name) => {
                 if matches!(t, Type::Start | Type::Empty) {
-                    if name.eq_ignore_ascii_case("pattern") {
-                        has_pattern = true;
+                    if matches!(t, Type::Start) {
+                        non_paint_depth += 1;
                     }
-                    non_paint_depth += 1;
                 } else if matches!(t, Type::End) {
                     non_paint_depth = non_paint_depth.saturating_sub(1);
                 }
             }
             Event::Tag(name, t, attrs) if is_open_tag(t) => {
-                if name.eq_ignore_ascii_case("image") {
+                let resolved = resolve_svg_styles_with_inheritance(
+                    &stylesheet,
+                    &std::collections::HashMap::new(),
+                    ancestor_styles.last().unwrap(),
+                    attrs,
+                    name,
+                );
+                if non_paint_depth == 0 {
+                    let has_effect = |key: &str| {
+                        resolved.get(key).is_some_and(|v| {
+                            let value = v.to_string();
+                            !value.trim().is_empty() && !value.trim().eq_ignore_ascii_case("none")
+                        })
+                    };
+                    // 已支持的矩形内描边有等价几何，其余 mask 不能直接丢弃。
+                    let supported_inside_stroke = *name == "rect"
+                        && svg_paint_fill_is_none_like(resolved.get("fill"))
+                        && svg_paint_stroke_is_usable(resolved.get("stroke"))
+                        && inside_mask_stroke_adjust_for_rect(&resolved, &masks).is_some();
+                    needs_effect_flattening |= (has_effect("mask") && !supported_inside_stroke)
+                        || has_effect("filter");
+                }
+                if name.eq_ignore_ascii_case("image") || name.eq_ignore_ascii_case("feImage") {
                     if svg_attr_href_value(attrs)
                         .is_some_and(|h| svg_href_points_to_raster_image(&h))
                     {
@@ -768,15 +810,13 @@ fn validate_svg_vector_convertible(
                     && matches!(&**name, "path" | "rect" | "circle" | "ellipse" | "polygon" | "polyline" | "line")
                 {
                     for key in ["fill", "stroke"] {
-                        if svg_paint_value_is_url_reference(attrs.get(key)) {
-                            let raw = attrs.get(key).map(|v| v.to_string()).unwrap_or_default();
+                        if svg_paint_value_is_url_reference(resolved.get(key)) {
+                            let raw = resolved.get(key).map(|v| v.to_string()).unwrap_or_default();
                             if let Some(id) = parse_svg_url_ref(&raw) {
-                                if !gradient_colors.contains_key(&id) {
-                                    if has_pattern {
-                                        visible_pattern_fill = true;
-                                    } else {
-                                        has_unresolved_gradient = true;
-                                    }
+                                if pattern_ids.contains(&id) {
+                                    visible_pattern_fill = true;
+                                } else if !gradient_colors.contains_key(&id) {
+                                    has_unresolved_gradient = true;
                                 }
                             }
                         }
@@ -784,6 +824,30 @@ fn validate_svg_vector_convertible(
                 }
             }
             _ => {}
+        }
+        // 仅继承绘制样式；mask/filter 作用于整个组，不应变成子节点属性。
+        if let Event::Tag(name @ ("svg" | "g"), t, attrs) = event {
+            match t {
+                Type::Start => {
+                    let resolved = resolve_svg_styles_with_inheritance(
+                        &stylesheet,
+                        gradient_colors,
+                        ancestor_styles.last().unwrap(),
+                        attrs,
+                        name,
+                    );
+                    let inherited = resolved.into_iter()
+                        .filter(|(key, _)| INHERITABLE_SVG_PRESENTATION_ATTRS.contains(&key.as_str()))
+                        .collect();
+                    ancestor_styles.push(inherited);
+                }
+                Type::End => {
+                    if ancestor_styles.len() > 1 {
+                        ancestor_styles.pop();
+                    }
+                }
+                Type::Empty => {}
+            }
         }
     }
 
@@ -794,7 +858,7 @@ fn validate_svg_vector_convertible(
                 .to_string(),
         );
     }
-    if has_pattern && visible_pattern_fill {
+    if visible_pattern_fill {
         return Err(
             "SVG 使用 pattern 平铺填充（如 Figma 导出的头像底图）。Chromium .icon 不支持 pattern，\
              无法保留位图内容；请改用纯色/描边的矢量图形。"
@@ -808,7 +872,11 @@ fn validate_svg_vector_convertible(
                 .to_string(),
         );
     }
-    Ok(())
+    Ok(if needs_effect_flattening {
+        SvgConversionMode::FlattenEffects
+    } else {
+        SvgConversionMode::Vector
+    })
 }
 
 fn svg_path_data_has_close_command(d: Option<&Value>) -> bool {
@@ -1212,41 +1280,127 @@ fn svg_mask_rects_approx_equal(a: SvgMaskRect, b: SvgMaskRect, eps: f32) -> bool
         && (a.r - b.r).abs() <= eps
 }
 
-/// 从 SVG 事件流收集 `<mask id="…">` 内 `<rect>` 几何，供识别「内描边」mask 模式。
+/// 仅收集可等价为内描边的 mask：单个不带效果的、不透明白色矩形。
+/// 仅几何相同不足以判定：黑色/半透明遮罩、额外形状或滤镜都会改变覆盖范围。
 fn collect_svg_mask_rects(events: &[Event]) -> std::collections::HashMap<String, Vec<SvgMaskRect>> {
-    let mut out: std::collections::HashMap<String, Vec<SvgMaskRect>> =
-        std::collections::HashMap::new();
-    let mut mask_id_stack: Vec<String> = Vec::new();
-    let mut mask_depth: usize = 0;
+    type Attributes = std::collections::HashMap<String, Value>;
+    struct Candidate {
+        id: String,
+        depth: usize,
+        safe: bool,
+        rects: Vec<SvgMaskRect>,
+    }
+    let mut out = std::collections::HashMap::new();
+    let stylesheet = collect_svg_stylesheet(events);
+    let mut ancestors = vec![Attributes::new()];
+    let mut candidate: Option<Candidate> = None;
+
+    let no_effects = |attrs: &Attributes| {
+        ["mask", "filter", "clip-path", "transform"]
+            .iter()
+            .all(|key| {
+                attrs
+                    .get(*key)
+                    .is_none_or(|v| v.to_string().trim().eq_ignore_ascii_case("none"))
+            })
+            && ["opacity", "fill-opacity"]
+                .iter()
+                .all(|key| attrs.get(*key).is_none_or(|v| parse_dim(v) == Some(1.0)))
+            && attrs
+                .get("display")
+                .is_none_or(|v| v.to_string().trim() == "inline")
+            && attrs
+                .get("visibility")
+                .is_none_or(|v| v.to_string().trim() == "visible")
+    };
 
     for event in events {
-        match event {
-            Event::Tag(name, t, attrs) if name.eq_ignore_ascii_case("mask") => match t {
-                Type::Start | Type::Empty => {
-                    let id = attrs
-                        .get("id")
-                        .map(|v| v.to_string())
-                        .unwrap_or_default();
-                    mask_id_stack.push(id);
-                    mask_depth += 1;
-                }
-                Type::End => {
-                    mask_id_stack.pop();
-                    mask_depth = mask_depth.saturating_sub(1);
-                }
-            },
-            Event::Tag("rect", t, attrs)
-                if matches!(t, Type::Start | Type::Empty) && mask_depth > 0 =>
+        let Event::Tag(name, t, attrs) = event else {
+            continue;
+        };
+        if matches!(t, Type::End) {
+            if ancestors.len() > 1 {
+                ancestors.pop();
+            }
+            if *name == "mask"
+                && candidate
+                    .as_ref()
+                    .is_some_and(|c| c.depth == ancestors.len())
             {
-                if let Some(id) = mask_id_stack.last() {
-                    if !id.is_empty() {
-                        out.entry(id.clone())
-                            .or_default()
-                            .push(parse_svg_rect_geometry(attrs));
-                    }
+                let c = candidate.take().unwrap();
+                if c.safe && !c.id.is_empty() && c.rects.len() == 1 {
+                    out.insert(c.id, c.rects);
                 }
             }
-            _ => {}
+            continue;
+        }
+
+        // 这里也保留 transform/clip-path/display 等属性，供保守校验；它们不继承。
+        let mut local = attrs.clone();
+        let mut selectors = vec![name.to_string()];
+        if let Some(classes) = attrs.get("class") {
+            selectors.extend(
+                classes
+                    .to_string()
+                    .split_whitespace()
+                    .map(|c| format!(".{}", c)),
+            );
+        }
+        if let Some(id) = attrs.get("id") {
+            selectors.push(format!("#{}", id));
+        }
+        for selector in selectors {
+            if let Some(decls) = stylesheet.get(&selector) {
+                local.extend(
+                    decls
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Value::from(v.as_str()))),
+                );
+            }
+        }
+        if let Some(style) = attrs.get("style") {
+            local.extend(
+                parse_inline_style_decls(&style.to_string())
+                    .into_iter()
+                    .map(|(k, v)| (k, Value::from(v))),
+            );
+        }
+        let resolved = resolve_svg_styles_with_inheritance(
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            ancestors.last().unwrap(),
+            &local,
+            name,
+        );
+        if let Some(c) = candidate.as_mut() {
+            c.safe &= matches!(*name, "rect" | "g") && no_effects(&resolved);
+            if *name == "rect" {
+                let fill = resolved
+                    .get("fill")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                c.safe &= parse_argb_quad(&color_to_argb(&fill)) == Some((255, 255, 255, 255))
+                    && !svg_paint_stroke_is_usable(resolved.get("stroke"));
+                c.rects.push(parse_svg_rect_geometry(&resolved));
+            }
+        } else if *name == "mask" && matches!(t, Type::Start) {
+            candidate = Some(Candidate {
+                id: attrs.get("id").map(|v| v.to_string()).unwrap_or_default(),
+                depth: ancestors.len(),
+                safe: no_effects(&resolved)
+                    && resolved.get("maskContentUnits").is_none_or(|v| v.to_string() == "userSpaceOnUse")
+                    // 显式裁剪区域可能截断矩形；已适配的 Figma 模式不需要它。
+                    && ["x", "y", "width", "height"].iter().all(|key| !resolved.contains_key(*key)),
+                rects: Vec::new(),
+            });
+        }
+        if matches!(t, Type::Start) {
+            ancestors.push(
+                resolved
+                    .into_iter()
+                    .filter(|(key, _)| INHERITABLE_SVG_PRESENTATION_ATTRS.contains(&key.as_str()))
+                    .collect(),
+            );
         }
     }
     out
@@ -2447,10 +2601,17 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
         .collect::<Vec<_>>();
 
     let gradient_colors = collect_svg_gradient_colors(&events);
-    validate_svg_vector_convertible(&events, &gradient_colors)?;
+    let mode = validate_svg_vector_convertible(&events, &gradient_colors)?;
 
     let parent = Path::new(svg_path).parent().unwrap_or_else(|| Path::new("."));
     let dst = PathBuf::from(parent).join(output_path);
+    if mode == SvgConversionMode::FlattenEffects {
+        // 完整合成成功后再写文件；解析失败不能截断已有输出。
+        let icon = effects::flatten_svg(&content, emit_path_colors)?;
+        std::fs::write(&dst, icon)
+            .map_err(|e| format!("Failed to write output file '{}': {}", dst.display(), e))?;
+        return Ok(dst.to_string_lossy().into_owned());
+    }
     let mut output_file = File::create(dst.clone()).map_err(|e| {
         format!(
             "Failed to create output file '{}': {}",
@@ -3771,6 +3932,192 @@ MOVE_TO, 0, 0,\nLINE_TO, 16, 0,\nLINE_TO, 16, 16,\nLINE_TO, 0, 16,\nCLOSE,\n";
             err
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn masked_blur_artwork_converts_with_matching_preview() {
+        let dir = std::env::temp_dir().join(format!("chromium_icon_masked_blur_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg_path = dir.join("raw.svg");
+        let icon_path = dir.join("raw.icon");
+        std::fs::write(&svg_path, include_str!("fixtures/raw_masked_blur.svg")).unwrap();
+        let _ = std::fs::remove_file(&icon_path);
+
+        for emit_path_colors in [true, false] {
+            try_convert_svg_to_chromium_icon_with_options(
+                svg_path.to_str().unwrap(),
+                "raw.icon",
+                &SvgToChromiumIconOptions { emit_path_colors },
+            ).unwrap();
+            let icon = std::fs::read_to_string(&icon_path).unwrap();
+            assert!(icon.len() < 200_000, "raw.svg should stay a reasonably sized icon");
+            let preview = try_convert_chromium_icon_path_to_svg_markup(icon_path.to_str().unwrap()).unwrap();
+            let render = |markup: &str, size: u32, backdrop: tiny_skia::Color| {
+                let tree = usvg::Tree::from_str(markup, &usvg::Options::default()).unwrap();
+                let mut image = tiny_skia::Pixmap::new(size, size).unwrap();
+                image.fill(backdrop);
+                let scale = size as f32 / tree.size().width();
+                resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut image.as_mut());
+                image
+            };
+            if emit_path_colors {
+                for (fill, backdrop) in [
+                    ("#ffffff", tiny_skia::Color::WHITE),
+                    ("#111111", tiny_skia::Color::from_rgba8(17, 17, 17, 255)),
+                ] {
+                    let preview = try_convert_chromium_icon_source_to_svg_markup_with_backdrop(&icon, fill).unwrap();
+                    for size in [16, 32, 64, 128] {
+                        let actual = render(&preview, size, backdrop);
+                        let original = render(include_str!("fixtures/raw_masked_blur.svg"), size, backdrop);
+                        let error: f64 = actual.data().iter().zip(original.data())
+                            .map(|(a, b)| (*a as f64 - *b as f64).abs()).sum::<f64>()
+                            / actual.data().len() as f64;
+                        assert!(error < 5.0, "preview mismatch at {}px on {}: {}", size, fill, error);
+                    }
+                }
+                let actual = render(&preview, 128, tiny_skia::Color::WHITE);
+                // 原先外露的两个椭圆中心都应是白底。
+                for y in [33, 95] {
+                    let pixel = actual.pixel(64, y).unwrap();
+                    assert!(pixel.red() > 248 && pixel.green() > 248 && pixel.blue() > 248);
+                }
+            } else {
+                assert!(!icon.contains("PATH_COLOR_ARGB"));
+                let actual = render(&preview, 128, tiny_skia::Color::WHITE);
+                assert_eq!(actual.pixel(64, 10).unwrap().red(), 255, "template must not include export background");
+                assert!(actual.pixel(64, 64).unwrap().red() < 100, "template silhouette missing");
+            }
+        }
+
+        let previous_icon = std::fs::read(&icon_path).unwrap();
+        // 效果展开不能绕过位图限制，失败也不能损坏上一次成功生成的图标。
+        std::fs::write(&svg_path, r#"<svg xmlns="http://www.w3.org/2000/svg"><g filter="url(#blur)"><image href="data:image/png;base64,AAAA"/></g></svg>"#).unwrap();
+        assert!(try_convert_svg_to_chromium_icon(svg_path.to_str().unwrap(), "raw.icon").is_err());
+        assert_eq!(std::fs::read(&icon_path).unwrap(), previous_icon);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn applied_masks_and_filters_use_effect_flattening_in_attributes_and_css() {
+        for effect in ["mask", "filter"] {
+            for tag in ["svg", "g", "path", "rect", "circle", "ellipse"] {
+                for (style, attr) in [
+                    (String::new(), format!(r#"{}="url(#effect)""#, effect)),
+                    (String::new(), format!(r#"style="{}:url(#effect)""#, effect)),
+                    (format!("<style>.fx {{ {}:url(#effect); }}</style>", effect), "class=\"fx\"".to_string()),
+                ] {
+                    // Empty definitions must not hide subsequent visible elements from validation.
+                    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\"><defs/>{}<{} {}/></svg>", style, tag, attr);
+                    let events = svg::read(&svg).unwrap().collect::<Vec<_>>();
+                    let mode = validate_svg_vector_convertible(&events, &collect_svg_gradient_colors(&events)).unwrap();
+                    assert_eq!(mode, SvgConversionMode::FlattenEffects, "{}", svg);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn effect_flattening_does_not_bypass_unsupported_images_or_patterns() {
+        for (svg, expected) in [
+            (r##"<svg xmlns="http://www.w3.org/2000/svg"><g filter="url(#f)"><rect width="16" height="16"/></g><defs><filter id="f"><feImage href="data:image/png;base64,AAAA"/></filter></defs></svg>"##, "位图"),
+            (r##"<svg xmlns="http://www.w3.org/2000/svg"><style>.p { fill:url(#p); }</style><g filter="url(#f)" class="p"><rect width="16" height="16"/></g><defs><pattern id="p" width="2" height="2"><rect width="1" height="1"/></pattern></defs></svg>"##, "pattern"),
+        ] {
+            let events = svg::read(svg).unwrap().collect::<Vec<_>>();
+            let error = validate_svg_vector_convertible(&events, &collect_svg_gradient_colors(&events)).unwrap_err();
+            assert!(error.contains(expected), "{}", error);
+        }
+    }
+
+    #[test]
+    fn unused_effect_definitions_and_explicit_none_are_allowed() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg">
+<defs><g mask="url(#unused)" filter="url(#blur)"><path d="M0 0H8V8Z"/></g>
+<filter id="blur"><feGaussianBlur stdDeviation="2"/></filter></defs>
+<style>.fx { mask:url(#unused); filter:url(#blur); }</style>
+<path class="fx" style="mask:none;filter:none" d="M0 0H8V8Z"/>
+</svg>"##;
+        let events = svg::read(svg).unwrap().collect::<Vec<_>>();
+        assert_eq!(validate_svg_vector_convertible(&events, &collect_svg_gradient_colors(&events)).unwrap(), SvgConversionMode::Vector);
+    }
+
+    #[test]
+    fn inside_stroke_mask_validation_uses_inherited_styles() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="#222">
+<mask id="inside" fill="white" stroke="none"><rect x="3" y="3" width="10" height="10"/></mask>
+<rect x="3" y="3" width="10" height="10" style="mask:url(#inside)"/>
+</svg>"##;
+        let events = svg::read(svg).unwrap().collect::<Vec<_>>();
+        assert_eq!(validate_svg_vector_convertible(&events, &collect_svg_gradient_colors(&events)).unwrap(), SvgConversionMode::Vector);
+    }
+
+    #[test]
+    fn non_equivalent_inside_stroke_masks_use_effect_flattening() {
+        let rect = r#"<rect x="3" y="3" width="10" height="10"/>"#;
+        for (mask_attrs, contents) in [
+            ("fill=\"black\"", rect.to_string()),
+            ("fill=\"white\" opacity=\"0.5\"", rect.to_string()),
+            ("fill=\"white\" class=\"faded\"", rect.to_string()),
+            ("fill=\"white\" filter=\"url(#blur)\"", rect.to_string()),
+            (
+                "fill=\"white\" maskContentUnits=\"objectBoundingBox\"",
+                rect.to_string(),
+            ),
+            ("fill=\"white\" width=\"5\"", rect.to_string()),
+            (
+                "fill=\"white\"",
+                rect.replace("<rect ", "<rect fill-opacity=\"0.5\" "),
+            ),
+            (
+                "fill=\"white\"",
+                rect.replace("<rect ", "<rect class=\"blurred\" "),
+            ),
+            (
+                "fill=\"white\"",
+                rect.replace("<rect ", "<rect style=\"fill:black\" "),
+            ),
+            (
+                "fill=\"white\"",
+                format!("{}<path d=\"M3 3H13V13Z\" fill=\"black\"/>", rect),
+            ),
+            (
+                "fill=\"white\"",
+                format!("<g transform=\"translate(2)\">{}</g>", rect),
+            ),
+            (
+                "fill=\"white\"",
+                format!("<g style=\"transform:translate(2px)\">{}</g>", rect),
+            ),
+        ] {
+            let svg = format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" fill="none">
+<style>.faded {{ opacity:0.5; }} .blurred {{ filter:url(#blur); }}</style>
+<mask id="inside" {}>{}</mask>
+<rect x="3" y="3" width="10" height="10" stroke="red" stroke-width="2" mask="url(#inside)"/>
+</svg>"##,
+                mask_attrs, contents
+            );
+            let events = svg::read(&svg).unwrap().collect::<Vec<_>>();
+            let mode =
+                validate_svg_vector_convertible(&events, &collect_svg_gradient_colors(&events))
+                    .unwrap();
+            assert_eq!(mode, SvgConversionMode::FlattenEffects, "{}", svg);
+        }
+    }
+
+    #[test]
+    fn inside_stroke_mask_resolves_white_css_and_ignores_empty_masks() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" fill="none">
+<style>.white { fill:white; }</style>
+<mask id="empty"/>
+<rect x="3" y="3" width="10" height="10" fill="white"/>
+<mask id="inside" class="white"><g><rect x="3" y="3" width="10" height="10"/></g></mask>
+<rect x="3" y="3" width="10" height="10" stroke="red" mask="url(#inside)"/>
+</svg>"##;
+        let events = svg::read(svg).unwrap().collect::<Vec<_>>();
+        let masks = collect_svg_mask_rects(&events);
+        assert!(!masks.contains_key("empty"));
+        assert_eq!(masks.get("inside").unwrap().len(), 1);
+        assert_eq!(validate_svg_vector_convertible(&events, &collect_svg_gradient_colors(&events)).unwrap(), SvgConversionMode::Vector);
     }
 
     /// Figma 内描边 mask：`STROKE` 减半 + 路径内缩至半像素（3,3,10,10 → 3.5,3.5,9,9），
