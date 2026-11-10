@@ -185,18 +185,30 @@ fn color_to_argb_with_alpha(color: &str, alpha_scale: f32) -> String {
     format!("0x{:02X}, {}, {}, {}", a_scaled, parts[1], parts[2], parts[3])
 }
 
+fn svg_opacity(value: Option<&Value>) -> f32 {
+    value.and_then(|v| {
+        let raw = v.to_string();
+        let raw = raw.trim();
+        if let Some(percent) = raw.strip_suffix('%') {
+            percent.parse::<f32>().ok().map(|n| n / 100.0)
+        } else {
+            raw.parse::<f32>().ok()
+        }
+    }).filter(|n| n.is_finite()).unwrap_or(1.0).clamp(0.0, 1.0)
+}
+
 /// 计算元素的有效绘制不透明度：`opacity * (fill-opacity 或 stroke-opacity)`。
 fn effective_svg_paint_opacity(
     attributes: &std::collections::HashMap<String, Value>,
     is_stroke: bool,
 ) -> f32 {
-    let opacity = parse_attr_f32(attributes, "opacity", 1.0).clamp(0.0, 1.0);
+    let opacity = svg_opacity(attributes.get("opacity"));
     let specific_key = if is_stroke {
         "stroke-opacity"
     } else {
         "fill-opacity"
     };
-    let specific = parse_attr_f32(attributes, specific_key, 1.0).clamp(0.0, 1.0);
+    let specific = svg_opacity(attributes.get(specific_key));
     opacity * specific
 }
 
@@ -3509,6 +3521,36 @@ pub fn convert_chromium_icon_to_svg(icon_path: &str, output_path: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn info_background_opacity_survives_icon_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("info_opacity_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("info.svg");
+        std::fs::write(&source, r##"<svg width="16" height="16" xmlns="http://www.w3.org/2000/svg">
+<style>.background { fill: #5046FF; fill-opacity: 10%; }</style>
+<circle class="background" cx="8" cy="8" r="8"/>
+<path fill="#5046FF" d="M7 6H9V12H7Z M7 3H9V5H7Z"/>
+</svg>"##).unwrap();
+        let output = super::try_convert_svg_to_chromium_icon(source.to_str().unwrap(), "info.icon").unwrap();
+        let icon = std::fs::read_to_string(output).unwrap();
+        assert!(icon.contains("PATH_COLOR_ARGB, 0x1A, 0x50, 0x46, 0xFF,"), "{icon}");
+        assert!(icon.contains("PATH_COLOR_ARGB, 0xFF, 0x50, 0x46, 0xFF,"), "{icon}");
+        let preview = super::try_convert_chromium_icon_source_to_svg_markup(&icon).unwrap();
+        assert!(preview.contains("#5046FF1A"), "{preview}");
+        assert!(preview.contains("#5046FF\""), "{preview}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn paint_opacity_multiplies_existing_alpha() {
+        let attrs = std::collections::HashMap::from([
+            ("fill".into(), svg::node::Value::from("#5046FF80")),
+            ("opacity".into(), svg::node::Value::from("0.5")),
+            ("fill-opacity".into(), svg::node::Value::from("50%")),
+        ]);
+        let alpha = super::effective_svg_paint_opacity(&attrs, false);
+        assert_eq!(super::color_to_argb_with_alpha(&attrs["fill"].to_string(), alpha), "0x20, 0x50, 0x46, 0xFF");
+    }
     use super::*;
 
     #[test]
