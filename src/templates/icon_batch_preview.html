@@ -230,14 +230,18 @@
             <div class="btn-row">
                 <label class="toolbar-field" style="display:flex;align-items:center;gap:8px;margin:0;font-size:.9rem;font-weight:600;color:#555;">
                     <input type="checkbox" id="emitPathColors" checked>
-                    写入 PATH_COLOR
+                    保留原图颜色
+                </label>
+                <label class="toolbar-field" style="display:flex;align-items:center;gap:8px;margin:0;font-size:.9rem;font-weight:600;color:#555;">
+                    <input type="checkbox" id="allowApproximation">
+                    近似复杂效果
                 </label>
                 <button type="button" class="btn" id="batchConvertBtn">SVG 全部 → .icon 并预览</button>
                 <button type="button" class="btn" id="refreshBtn">仅刷新预览</button>
             </div>
             <p class="hint">
-                工作目录可直接填写、从历史中选择，或点「选择目录…」。最近使用的 10 个目录保存在当前浏览器中。点「SVG 全部 → .icon」会枚举该目录下所有 <code>.svg</code>，在同目录生成 <code>.icon</code>。取消勾选「写入 PATH_COLOR」时生成的 <code>.icon</code> 不含颜色行。
-                含遮罩或模糊的 SVG 会近似保留效果，生成文件可能较大；彩色模式保留原图背景，取消颜色后输出透明背景的单色轮廓。
+                工作目录可直接填写、从历史中选择，或点「选择目录…」。最近使用的 10 个目录保存在当前浏览器中。点「SVG 全部 → .icon」会枚举该目录下所有 <code>.svg</code>，在同目录生成 <code>.icon</code>。取消勾选「保留原图颜色」后由 Chromium 运行时统一上色，仍保留透明度。
+                默认遇到无法准确转换的效果时报错；勾选「近似复杂效果」可尝试保留遮罩、模糊等外观，但可能损失细节并增大文件。关闭颜色只影响上色方式，不会自动删除原图背景。服务重启后，请重新选择目录或执行转换，再刷新该目录的预览。
             </p>
             <p id="dirPath" aria-live="polite"></p>
         </div>
@@ -264,6 +268,7 @@
             var dirPath = document.getElementById('dirPath');
             var batchSummary = document.getElementById('batchSummary');
             var emitPathColorsInput = document.getElementById('emitPathColors');
+            var allowApproximationInput = document.getElementById('allowApproximation');
             var previewLegend = document.getElementById('previewLegend');
             var previewBgRadios = document.querySelectorAll('input[name="previewBg"]');
             /** @type {boolean} */
@@ -521,6 +526,7 @@
                         body: JSON.stringify({
                             directory: trimmed,
                             emit_path_colors: emitPathColorsInput.checked,
+                            allow_approximation: allowApproximationInput.checked,
                         }),
                     });
                     var raw = await res.text();

@@ -1,31 +1,78 @@
-use std::fs;
-use resvg::usvg::{Tree, Options};
 use resvg::tiny_skia::{Pixmap, Transform};
 
-pub fn convert_svg_to_png(svg_path: &str, out_path: &str) -> String {
-    let svg_data = fs::read(svg_path).expect("Failed to read SVG file");
-    let opt = Options::default();
-    let rtree = Tree::from_data(&svg_data, &opt).expect("Failed to parse SVG data");
-  
-    let size = rtree.size();
+pub(crate) fn render_svg(content: &str) -> Result<Pixmap, String> {
+    let tree = super::svg_document::parse_svg(content)?;
+    let size = tree.size();
     let width = size.width().ceil() as u32;
     let height = size.height().ceil() as u32;
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 64 * 1024 * 1024 {
+        return Err("SVG 栅格尺寸必须大于零且不超过 6400 万像素".to_string());
+    }
+    let mut pixmap =
+        Pixmap::new(width, height).ok_or_else(|| "无法创建 SVG 渲染画布".to_string())?;
+    // Integer output bounds contain the original viewport without stretching.
+    resvg::render(&tree, Transform::identity(), &mut pixmap.as_mut());
+    Ok(pixmap)
+}
 
-    let mut pixmap = Pixmap::new(width, height).expect("Failed to create Pixmap");
+pub fn try_convert_svg_to_png(svg_path: &str, out_path: &str) -> Result<String, String> {
+    let content = std::fs::read_to_string(svg_path)
+        .map_err(|e| format!("Failed to read SVG '{svg_path}': {e}"))?;
+    let pixmap = render_svg(&content)?;
+    let bytes = pixmap
+        .encode_png()
+        .map_err(|e| format!("Failed to encode PNG: {e}"))?;
+    let output = std::path::Path::new(svg_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(out_path);
+    super::image_util::write_output_atomic(&output, &bytes)?;
+    Ok(output.to_string_lossy().into_owned())
+}
 
-    let svg_size = rtree.size();
-    let scale_x = width as f32 / svg_size.width() as f32;
-    let scale_y = height as f32 / svg_size.height() as f32;
-    let scale = scale_x.min(scale_y);
+pub fn convert_svg_to_png(svg_path: &str, out_path: &str) -> String {
+    try_convert_svg_to_png(svg_path, out_path).expect("Failed to convert SVG to PNG")
+}
 
-    let transform = Transform::from_scale(scale, scale);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    resvg::render(
-        &rtree,
-        transform,
-        &mut pixmap.as_mut(),
-    );
-    let output_path = std::path::Path::new(svg_path).parent().unwrap().join(out_path);
-    pixmap.save_png(output_path.clone()).expect("Failed to save PNG file");
-    output_path.to_str().unwrap().to_string()
+    #[test]
+    fn figma_sun_png_has_all_eight_rays_and_transparent_center() {
+        let source = include_str!("fixtures/light_mode_use.svg").replacen(
+            "width=\"16\" height=\"16\"",
+            "width=\"160\" height=\"160\"",
+            1,
+        );
+        let image = render_svg(&source).unwrap();
+        for (x, y) in [
+            (80, 10),
+            (130, 30),
+            (150, 80),
+            (130, 130),
+            (80, 150),
+            (30, 130),
+            (10, 80),
+            (30, 30),
+        ] {
+            let visible = ((y - 5)..=(y + 5))
+                .any(|py| ((x - 5)..=(x + 5)).any(|px| image.pixel(px, py).unwrap().alpha() > 128));
+            assert!(visible, "missing ray at ({x}, {y})");
+        }
+        assert_eq!(image.pixel(80, 80).unwrap().alpha(), 0);
+    }
+
+    #[test]
+    fn failed_svg_conversion_preserves_existing_output() {
+        let directory = std::env::temp_dir().join(format!("svg_png_atomic_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("bad.svg");
+        let output = directory.join("result.png");
+        std::fs::write(&source, "<svg>").unwrap();
+        std::fs::write(&output, b"previous output").unwrap();
+        assert!(try_convert_svg_to_png(source.to_str().unwrap(), "result.png").is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous output");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

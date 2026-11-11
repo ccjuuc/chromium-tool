@@ -72,8 +72,11 @@ async fn main() -> Result<()> {
     let app = api::routes::create_router(app_state);
     
     // 启动服务器
-    let listener = TcpListener::bind("0.0.0.0:3000").await?;
-    tracing::info!("Server listening on 0.0.0.0:3000");
+    let bind_address = std::env::var("CHROMIUM_TOOL_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:3000".to_string())
+        .parse::<std::net::SocketAddr>()?;
+    let listener = TcpListener::bind(bind_address).await?;
+    tracing::info!("Server listening on {}", bind_address);
     axum::serve(listener, app).await?;
     
     Ok(())

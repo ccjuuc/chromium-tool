@@ -6,6 +6,8 @@ use axum::{
 };
 use std::env::{current_dir, var_os};
 use std::path::PathBuf;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock, RwLock, atomic::{AtomicU64, Ordering}};
 use serde::{Deserialize, Serialize};
 use base64::engine::general_purpose::STANDARD;
 use base64::engine::Engine;
@@ -37,6 +39,9 @@ fn convert_work_dir() -> Result<PathBuf, std::io::Error> {
 
 /// 仅允许单层文件名，禁止路径穿越。
 fn sanitize_convert_output_basename(raw: &str) -> Result<String, &'static str> {
+    if raw.contains(['/', '\\', ':', '<', '>', '"', '|', '?', '*']) || raw.ends_with([' ', '.']) {
+        return Err("output must be a single filename");
+    }
     let name = std::path::Path::new(raw)
         .file_name()
         .and_then(|s| s.to_str())
@@ -46,8 +51,14 @@ fn sanitize_convert_output_basename(raw: &str) -> Result<String, &'static str> {
         (Some(std::path::Component::Normal(_)), None) => {}
         _ => return Err("invalid output filename"),
     }
-    if name.is_empty() || name.len() > 512 {
+    if name.is_empty() || name.len() > 255 || name.chars().any(char::is_control) {
         return Err("invalid output filename");
+    }
+    let device = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || device.strip_prefix("COM").or_else(|| device.strip_prefix("LPT"))
+            .is_some_and(|suffix| matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")) {
+        return Err("reserved output filename");
     }
     Ok(name.to_string())
 }
@@ -61,20 +72,67 @@ pub struct IconPreviewRootQuery {
     bg: Option<String>,
 }
 
-/// 批量预览用根目录：`root` 省略时等价于 [`convert_work_dir`]；传入时须为已存在的文件夹（会 canonicalize）。
+fn registered_preview_directories() -> &'static RwLock<HashSet<PathBuf>> {
+    static DIRECTORIES: OnceLock<RwLock<HashSet<PathBuf>>> = OnceLock::new();
+    DIRECTORIES.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+fn canonical_directory(path: &std::path::Path) -> Result<PathBuf, String> {
+    let path = path.canonicalize().map_err(|e| format!("无法访问目录: {} ({e})", path.display()))?;
+    if !path.is_dir() { return Err("指定路径必须是目录".into()); }
+    Ok(path)
+}
+
+fn register_preview_directory(path: &std::path::Path) -> Result<PathBuf, String> {
+    let path = canonical_directory(path)?;
+    registered_preview_directories().write().map_err(|_| "目录登记不可用")?.insert(path.clone());
+    Ok(path)
+}
+
+/// Only the default output directory and directories explicitly selected or
+/// submitted for conversion through the same-origin UI may be read.
 fn resolve_icon_preview_directory(root_param: Option<&str>) -> Result<PathBuf, String> {
-    if let Some(s) = root_param.map(str::trim).filter(|s| !s.is_empty()) {
-        let p = PathBuf::from(s);
-        let meta = std::fs::metadata(&p)
-            .map_err(|e| format!("无法访问目录: {} ({})", p.display(), e))?;
-        if !meta.is_dir() {
-            return Err("指定路径必须是目录".to_string());
-        }
-        p.canonicalize()
-            .map_err(|e| format!("无法规范化目录: {} ({})", p.display(), e))
+    let default = convert_work_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&default).map_err(|e| e.to_string())?;
+    let default = canonical_directory(&default)?;
+    let requested = match root_param.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(path) => canonical_directory(std::path::Path::new(path))?,
+        None => return Ok(default),
+    };
+    if requested == default || registered_preview_directories().read()
+        .map_err(|_| "目录登记不可用")?.contains(&requested) {
+        Ok(requested)
     } else {
-        convert_work_dir().map_err(|e| format!("convert dir: {}", e))
+        Err("该目录尚未授权，请先选择目录或执行转换".into())
     }
+}
+
+fn is_preview_asset(name: &str) -> bool {
+    matches!(std::path::Path::new(name).extension().and_then(|v| v.to_str())
+        .map(str::to_ascii_lowercase).as_deref(),
+        Some("svg" | "icon" | "png" | "ico" | "icns" | "jpg" | "jpeg" | "webp" | "bmp"))
+}
+
+fn resolve_preview_asset(root: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+    let name = sanitize_convert_output_basename(name).map_err(str::to_string)?;
+    if !is_preview_asset(&name) { return Err("仅允许读取图像或图标文件".into()); }
+    let path = root.join(name).canonicalize().map_err(|e| format!("文件不可用: {e}"))?;
+    if path.parent() != Some(root) || !path.is_file() {
+        return Err("文件不在授权目录内".into());
+    }
+    Ok(path)
+}
+
+fn checked_output_path(root: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+    let name = sanitize_convert_output_basename(name).map_err(str::to_string)?;
+    let path = root.join(name);
+    if std::fs::symlink_metadata(&path).is_ok() {
+        let existing = path.canonicalize().map_err(|e| e.to_string())?;
+        if existing.parent() != Some(root) || !existing.is_file() {
+            return Err("输出文件不在工作目录内".into());
+        }
+    }
+    Ok(path)
 }
 
 /// 将 Windows `canonicalize` 产生的 verbatim 路径转换为适合界面展示和再次输入的常规路径。
@@ -128,6 +186,9 @@ fn convert_output_content_type(file_name: &str) -> &'static str {
         Some("icns") => "application/octet-stream",
         Some("icon") => "text/plain; charset=utf-8",
         Some("svg") => "image/svg+xml; charset=utf-8",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
         _ => "application/octet-stream",
     }
 }
@@ -145,13 +206,17 @@ pub async fn get_convert_output(
         Ok(p) => p,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
-    let path = work_dir.join(&safe);
+    let path = match resolve_preview_asset(&work_dir, &safe) {
+        Ok(path) => path,
+        Err(message) => return (StatusCode::FORBIDDEN, message).into_response(),
+    };
     match std::fs::read(&path) {
         Ok(bytes) => {
             let ct = convert_output_content_type(&safe);
             (
                 StatusCode::OK,
-                [(CONTENT_TYPE, ct)],
+                [(CONTENT_TYPE.as_str(), ct), ("x-content-type-options", "nosniff"),
+                 ("content-security-policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:")],
                 bytes,
             )
                 .into_response()
@@ -187,7 +252,10 @@ pub async fn get_convert_output_svg(
         Ok(p) => p,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
-    let path = work_dir.join(&safe);
+    let path = match resolve_preview_asset(&work_dir, &safe) {
+        Ok(path) => path,
+        Err(message) => return (StatusCode::FORBIDDEN, message).into_response(),
+    };
     let path_str = match path.to_str() {
         Some(s) => s,
         None => return (StatusCode::BAD_REQUEST, "Invalid path").into_response(),
@@ -244,10 +312,12 @@ pub async fn select_icon_preview_directory(
         }
     };
 
+    let directory = match selected.as_deref().map(register_preview_directory).transpose() {
+        Ok(directory) => directory,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
     Json(IconPreviewSelectDirectoryResponse {
-        directory: selected
-            .as_deref()
-            .map(display_icon_preview_directory),
+        directory: directory.as_deref().map(display_icon_preview_directory),
     })
     .into_response()
 }
@@ -291,7 +361,7 @@ pub async fn list_icon_preview_files(Query(q): Query<IconPreviewRootQuery>) -> i
             Err(_) => continue,
         };
         // 与下载/预览接口共用同一套 basename 校验，避免列出无法访问的奇怪名字。
-        if sanitize_convert_output_basename(&name).is_err() {
+        if resolve_preview_asset(&work_dir, &name).is_err() {
             continue;
         }
         let lower = name.to_ascii_lowercase();
@@ -329,6 +399,8 @@ pub struct IconPreviewBatchConvertRequest {
     /// 是否在 `.icon` 中输出 `PATH_COLOR_ARGB`。省略或 `null` 视为 `true`。
     #[serde(default)]
     pub emit_path_colors: Option<bool>,
+    #[serde(default)]
+    pub allow_approximation: bool,
 }
 
 #[derive(Serialize)]
@@ -353,15 +425,23 @@ pub struct IconPreviewBatchConvertResponse {
 pub async fn icon_preview_batch_convert(
     Json(body): Json<IconPreviewBatchConvertRequest>,
 ) -> impl IntoResponse {
+    match tokio::task::spawn_blocking(move || convert_icon_directory(body)).await {
+        Ok(response) => response,
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("转换任务失败: {error}")).into_response(),
+    }
+}
+
+fn convert_icon_directory(body: IconPreviewBatchConvertRequest) -> axum::response::Response {
     let emit_path_colors = body.emit_path_colors.unwrap_or(true);
     let icon_opts = chromium_icon::SvgToChromiumIconOptions {
         emit_path_colors,
+        approximate_effects: body.allow_approximation,
     };
     let trimmed = body.directory.trim();
     if trimmed.is_empty() {
         return (StatusCode::BAD_REQUEST, "请填写目录路径").into_response();
     }
-    let root = match resolve_icon_preview_directory(Some(trimmed)) {
+    let root = match register_preview_directory(std::path::Path::new(trimmed)) {
         Ok(p) => p,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
@@ -414,10 +494,11 @@ pub async fn icon_preview_batch_convert(
             }
         };
         let out_basename = format!("{}.icon", stem);
-        if sanitize_convert_output_basename(&out_basename).is_err() {
+        if let Err(message) = resolve_preview_asset(&root, &fname)
+            .and_then(|_| checked_output_path(&root, &out_basename)) {
             errors.push(IconPreviewBatchConvertItemError {
                 file: fname,
-                message: "生成的 .icon 文件名不合法".to_string(),
+                message,
             });
             continue;
         }
@@ -471,148 +552,151 @@ struct ConvertImageOk {
     preview_name: String,
 }
 
-pub async fn convert_image(Json(payload): Json<ConvertRequest>) -> impl IntoResponse {
-    let work_dir = match convert_work_dir() {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to resolve convert output directory: {}", e),
-            )
-                .into_response();
-        }
+fn validate_conversion_request(payload: &ConvertRequest) -> Result<(String, String, String), String> {
+    let output_name = sanitize_convert_output_basename(&payload.output_path).map_err(str::to_string)?;
+    let original_name = sanitize_convert_output_basename(&original_storage_name(&payload.logo_name))
+        .map_err(str::to_string)?;
+    let format = payload.format.to_ascii_uppercase();
+    let expected_extension = match format.as_str() {
+        "ICON" => "icon", "ICO" => "ico", "ICNS" => "icns", "PNG" => "png", "SVG" => "svg",
+        _ => return Err(format!("Unsupported format: {}", payload.format)),
     };
-
-    if let Err(e) = std::fs::create_dir_all(&work_dir) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to create convert output directory {}: {}", work_dir.display(), e),
-        )
-            .into_response();
+    let output_extension = std::path::Path::new(&output_name).extension().and_then(|s| s.to_str()).unwrap_or("");
+    if !output_extension.eq_ignore_ascii_case(expected_extension) {
+        return Err("输出文件后缀与转换格式不一致".into());
     }
-
-    // 上传的原图统一以 `<stem>-ori<ext>` 落盘，与转换输出区分，避免互相覆盖、便于回溯。
-    let original_name = original_storage_name(&payload.logo_name);
-    let logo_path_buf = work_dir.join(&original_name);
-
-    let logo_path = match logo_path_buf.to_str() {
-        Some(path) => path,
-        None => return (StatusCode::BAD_REQUEST, "Invalid logo path").into_response(),
-    };
-
-    let logo_data = match STANDARD.decode(&payload.logo_data) {
-        Ok(data) => data,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid base64 data: {}", e)).into_response(),
-    };
-
-    if let Err(e) = std::fs::write(logo_path, &logo_data) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e)).into_response();
+    if original_name.eq_ignore_ascii_case(&output_name) {
+        return Err("输出文件不能覆盖上传的原图".into());
     }
+    let source_extension = std::path::Path::new(&original_name).extension()
+        .and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+    match format.as_str() {
+        "ICON" | "PNG" if source_extension != "svg" => return Err("此转换需要 SVG 源文件".into()),
+        "SVG" if source_extension != "icon" => return Err("SVG 导出需要 .icon 源文件".into()),
+        "ICO" | "ICNS" if !matches!(source_extension.as_str(), "svg" | "png" | "jpg" | "jpeg" | "webp" | "bmp" | "ico" | "tif" | "tiff") => {
+            return Err("不支持此源图像格式".into());
+        }
+        _ => {}
+    }
+    Ok((original_name, output_name, format))
+}
 
-    let safe_output_name = match sanitize_convert_output_basename(&payload.output_path) {
-        Ok(s) => s,
-        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
-    };
-    let format = &payload.format;
+struct ConversionStaging(PathBuf);
 
-    tracing::info!(
-        "convert_image: original='{}', output='{}', format='{}', size={}",
-        original_name,
-        safe_output_name,
-        format,
-        logo_data.len()
-    );
-
-    let icon_opts = chromium_icon::SvgToChromiumIconOptions {
-        emit_path_colors: payload.emit_path_colors.unwrap_or(true),
-    };
-
-    // 把可能 panic 的转换函数放到 catch_unwind 里，确保即便底层 svg 解析
-    // 等地方 panic，也能把可读的错误回给前端而不是返回空 500。
-    let logo_path_owned = logo_path.to_string();
-    let output_path_owned = safe_output_name.clone();
-    let format_owned = format.clone();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        match format_owned.as_str() {
-            "ICO" => Ok(image_util::generate_chromium_ico(
-                &logo_path_owned,
-                &output_path_owned,
-            )),
-            "ICON" => chromium_icon::try_convert_svg_to_chromium_icon_with_options(
-                &logo_path_owned,
-                &output_path_owned,
-                &icon_opts,
-            ),
-            "ICNS" => Ok(image_util::generate_chromium_icns(
-                &logo_path_owned,
-                &output_path_owned,
-                true,
-            )),
-            "PNG" => {
-                if logo_path_owned.ends_with(".svg") {
-                    Ok(svg_png::convert_svg_to_png(&logo_path_owned, &output_path_owned))
-                } else {
-                    Err("svg file is required for PNG conversion".to_string())
-                }
+impl ConversionStaging {
+    fn new(root: &std::path::Path) -> Result<Self, String> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..100 {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = root.join(format!(".convert-{}-{id}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("无法创建转换目录: {error}")),
             }
-            "SVG" => {
-                let lower = logo_path_owned.to_ascii_lowercase();
-                if !lower.ends_with(".icon") {
-                    return Err(".icon source file is required for SVG conversion".to_string());
-                }
-                let svg = chromium_icon::try_convert_chromium_icon_path_to_svg_markup(&logo_path_owned)?;
-                let parent = std::path::Path::new(&logo_path_owned)
-                    .parent()
-                    .ok_or_else(|| "invalid logo path".to_string())?;
-                let out_full = parent.join(&output_path_owned);
-                std::fs::write(&out_full, svg.as_bytes()).map_err(|e| {
-                    format!(
-                        "Failed to write SVG to {}: {}",
-                        out_full.display(),
-                        e
-                    )
-                })?;
-                Ok(out_full.to_string_lossy().into_owned())
-            }
-            other => Err(format!("Unsupported format: {}", other)),
         }
-    }));
-
-    match result {
-        Ok(Ok(ret)) => {
-            tracing::info!("convert_image ok: {}", ret);
-            (
-                StatusCode::OK,
-                Json(ConvertImageOk {
-                    message: ret,
-                    preview_name: safe_output_name,
-                }),
-            )
-                .into_response()
-        }
-        Ok(Err(msg)) => {
-            tracing::error!("convert_image error: {}", msg);
-            (StatusCode::BAD_REQUEST, msg).into_response()
-        }
-        Err(panic_payload) => {
-            // panic 信息可能是 &str 或 String
-            let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "panic without message".to_string()
-            };
-            tracing::error!("convert_image panicked: {}", msg);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Conversion panicked: {}", msg),
-            )
-                .into_response()
-        }
+        Err("无法创建独立转换目录".into())
     }
 }
 
+impl Drop for ConversionStaging {
+    fn drop(&mut self) {
+        // This exact directory was exclusively created by ConversionStaging::new.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn run_image_conversion(payload: ConvertRequest) -> Result<ConvertImageOk, String> {
+    let work_dir = convert_work_dir().map_err(|e| e.to_string())?;
+    run_image_conversion_in_directory(payload, &work_dir)
+}
+
+fn publish_conversion(
+    staging: &ConversionStaging,
+    input: &std::path::Path,
+    original_destination: &std::path::Path,
+    output: &std::path::Path,
+    output_destination: &std::path::Path,
+) -> Result<(), String> {
+    // Publishing the source and result is serialized so concurrent requests
+    // cannot pair one request's source with another request's result.
+    static PUBLISH_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = PUBLISH_LOCK.lock().map_err(|_| "转换输出不可用")?;
+    let previous_source = staging.0.join(".previous-source");
+    let had_source = original_destination.exists();
+    if had_source {
+        std::fs::copy(original_destination, &previous_source)
+            .map_err(|e| format!("无法备份原图: {e}"))?;
+    }
+    std::fs::rename(input, original_destination).map_err(|e| format!("无法保存原图: {e}"))?;
+    if let Err(error) = std::fs::rename(output, output_destination) {
+        let rollback = if had_source {
+            std::fs::rename(previous_source, original_destination)
+        } else {
+            std::fs::remove_file(original_destination)
+        };
+        return match rollback {
+            Ok(()) => Err(format!("无法保存输出，已恢复原图: {error}")),
+            Err(rollback_error) => Err(format!("无法保存输出: {error}；恢复原图失败: {rollback_error}")),
+        };
+    }
+    Ok(())
+}
+
+fn run_image_conversion_in_directory(
+    payload: ConvertRequest,
+    work_dir: &std::path::Path,
+) -> Result<ConvertImageOk, String> {
+    // Validate every name/format before creating or replacing any output.
+    let (original_name, output_name, format) = validate_conversion_request(&payload)?;
+    let logo_data = STANDARD.decode(&payload.logo_data).map_err(|e| format!("Invalid base64 data: {e}"))?;
+    if logo_data.is_empty() { return Err("源文件不能为空".into()); }
+    std::fs::create_dir_all(work_dir).map_err(|e| e.to_string())?;
+    let work_dir = canonical_directory(work_dir)?;
+    let original_destination = checked_output_path(&work_dir, &original_name)?;
+    let output_destination = checked_output_path(&work_dir, &output_name)?;
+    let staging = ConversionStaging::new(&work_dir)?;
+    let input = staging.0.join(&original_name);
+    std::fs::write(&input, logo_data).map_err(|e| format!("无法保存转换输入: {e}"))?;
+    let input_str = input.to_str().ok_or("Invalid source path")?;
+    let icon_options = chromium_icon::SvgToChromiumIconOptions {
+        emit_path_colors: payload.emit_path_colors.unwrap_or(true),
+        approximate_effects: payload.allow_approximation,
+    };
+    match format.as_str() {
+        "ICO" => { image_util::try_generate_chromium_ico(input_str, &output_name)?; }
+        "ICNS" => { image_util::try_generate_chromium_icns(input_str, &output_name, true)?; }
+        "ICON" => { chromium_icon::try_convert_svg_to_chromium_icon_with_options(input_str, &output_name, &icon_options)?; }
+        "PNG" => { svg_png::try_convert_svg_to_png(input_str, &output_name)?; }
+        "SVG" => {
+            let svg = chromium_icon::try_convert_chromium_icon_path_to_svg_markup(input_str)?;
+            std::fs::write(staging.0.join(&output_name), svg).map_err(|e| format!("无法保存 SVG: {e}"))?;
+        }
+        _ => unreachable!("validated output format"),
+    }
+    let output = staging.0.join(&output_name);
+    if std::fs::metadata(&output).map_err(|e| e.to_string())?.len() == 0 {
+        return Err("转换未生成有效内容".into());
+    }
+    // Only completed conversions replace existing artifacts; failed conversions
+    // leave both the previous output and its associated source untouched.
+    publish_conversion(&staging, &input, &original_destination, &output, &output_destination)?;
+    Ok(ConvertImageOk {
+        message: output_destination.to_string_lossy().into_owned(),
+        preview_name: output_name,
+    })
+}
+
+pub async fn convert_image(Json(payload): Json<ConvertRequest>) -> impl IntoResponse {
+    match tokio::task::spawn_blocking(move || run_image_conversion(payload)).await {
+        Ok(Ok(result)) => (StatusCode::OK, Json(result)).into_response(),
+        Ok(Err(error)) => (StatusCode::BAD_REQUEST, error).into_response(),
+        Err(error) => {
+            tracing::error!("conversion worker failed: {error}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "转换任务失败，原输出已保留").into_response()
+        }
+    }
+}
 pub async fn oem_convert(Json(payload): Json<OemRequest>) -> impl IntoResponse {
     
     let logo_dir = match current_dir() {
@@ -758,7 +842,109 @@ pub async fn add_rounded_corners(Json(payload): Json<CornerRequest>) -> impl Int
 
 #[cfg(test)]
 mod tests {
-    use super::original_storage_name;
+    use super::*;
+
+    fn conversion_request(source: &str, output: &str, format: &str) -> ConvertRequest {
+        ConvertRequest {
+            logo_name: source.into(),
+            logo_data: STANDARD.encode("not an image"),
+            output_path: output.into(),
+            format: format.into(),
+            emit_path_colors: None,
+            allow_approximation: false,
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_conversion_contract_before_creating_files() {
+        let temporary = ConversionStaging::new(&std::env::temp_dir()).unwrap();
+        let output_dir = temporary.0.join("not-created");
+        for (source, output, format) in [
+            ("image.svg", "result.png", "unknown"),
+            ("image.svg", "result.svg", "PNG"),
+            ("image.png", "image-ori.png", "PNG"),
+            ("image.png", "result.icon", "ICON"),
+            ("image.svg", "result.svg", "SVG"),
+            ("image.icon", "result.ico", "ICO"),
+            ("image.svg", "../result.png", "PNG"),
+            ("image.svg", "file:result.png", "PNG"),
+        ] {
+            assert!(run_image_conversion_in_directory(
+                conversion_request(source, output, format), &output_dir
+            ).is_err(), "{source} -> {output} ({format}) must be rejected");
+            assert!(!output_dir.exists());
+        }
+        assert!(validate_conversion_request(&conversion_request("image.SVG", "result.ICON", "icon")).is_ok());
+    }
+
+    #[test]
+    fn rejects_nonportable_and_device_filenames() {
+        for name in ["../a.icon", "..\\a.icon", "a.icon:stream", "NUL.png", "com1.svg", "LPT².ico", "a.icon.", "a?.svg", "a\n.svg"] {
+            assert!(sanitize_convert_output_basename(name).is_err(), "{name:?} must be rejected");
+        }
+        assert!(sanitize_convert_output_basename("外观颜色-亮色模式.icon").is_ok());
+    }
+
+    #[test]
+    fn malformed_input_preserves_existing_source_and_output() {
+        let temporary = ConversionStaging::new(&std::env::temp_dir()).unwrap();
+        let original = temporary.0.join("image-ori.png");
+        let output = temporary.0.join("result.ico");
+        std::fs::write(&original, b"previous original").unwrap();
+        std::fs::write(&output, b"previous output").unwrap();
+        assert!(run_image_conversion_in_directory(
+            conversion_request("image.png", "result.ico", "ICO"), &temporary.0
+        ).is_err());
+        assert_eq!(std::fs::read(original).unwrap(), b"previous original");
+        assert_eq!(std::fs::read(output).unwrap(), b"previous output");
+        assert_eq!(std::fs::read_dir(&temporary.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failed_output_publication_restores_previous_source() {
+        let temporary = ConversionStaging::new(&std::env::temp_dir()).unwrap();
+        let staging = ConversionStaging::new(&temporary.0).unwrap();
+        let original = temporary.0.join("image-ori.svg");
+        let output = temporary.0.join("result.icon");
+        let staged_input = staging.0.join("image-ori.svg");
+        std::fs::write(&original, b"previous original").unwrap();
+        std::fs::write(&output, b"previous output").unwrap();
+        std::fs::write(&staged_input, b"new original").unwrap();
+        assert!(publish_conversion(&staging, &staged_input, &original,
+            &staging.0.join("missing.icon"), &output).is_err());
+        assert_eq!(std::fs::read(original).unwrap(), b"previous original");
+        assert_eq!(std::fs::read(output).unwrap(), b"previous output");
+    }
+
+    #[test]
+    fn preview_requires_registered_directory_and_image_file() {
+        let temporary = ConversionStaging::new(&std::env::temp_dir()).unwrap();
+        let root = canonical_directory(&temporary.0).unwrap();
+        let root_string = root.to_string_lossy();
+        assert!(resolve_icon_preview_directory(Some(&root_string)).is_err());
+        register_preview_directory(&root).unwrap();
+        assert_eq!(resolve_icon_preview_directory(Some(&root_string)).unwrap(), root);
+        std::fs::write(root.join("private.txt"), b"private").unwrap();
+        std::fs::write(root.join("asset.icon"), b"CANVAS_DIMENSIONS, 16").unwrap();
+        assert!(resolve_preview_asset(&root, "private.txt").is_err());
+        assert!(resolve_preview_asset(&root, "../asset.icon").is_err());
+        assert_eq!(resolve_preview_asset(&root, "asset.icon").unwrap(), root.join("asset.icon"));
+        registered_preview_directories().write().unwrap().remove(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_and_outputs_reject_symlinks_outside_directory() {
+        let temporary = ConversionStaging::new(&std::env::temp_dir()).unwrap();
+        let root_dir = temporary.0.join("authorized");
+        std::fs::create_dir(&root_dir).unwrap();
+        let root = canonical_directory(&root_dir).unwrap();
+        let outside = temporary.0.join("outside.svg");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("asset.svg")).unwrap();
+        assert!(resolve_preview_asset(&root, "asset.svg").is_err());
+        assert!(checked_output_path(&root, "asset.svg").is_err());
+    }
 
     #[test]
     fn appends_ori_before_extension() {

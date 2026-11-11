@@ -351,8 +351,8 @@
                 <div class="card-title">格式转换</div>
                 <form id="convertImageForm">
                     <div class="form-group">
-                        <label for="logo_path">原图文件 (SVG / PNG / Chromium .icon)</label>
-                        <input type="file" id="logo_path" name="logo_path" accept=".png,.svg,.jpg,.jpeg,.icon" required>
+                        <label for="logo_path">原图文件 (SVG / 常见位图 / Chromium .icon)</label>
+                        <input type="file" id="logo_path" name="logo_path" accept=".png,.svg,.jpg,.jpeg,.webp,.bmp,.ico,.tif,.tiff,.icon" required>
                     </div>
                     <div class="form-group">
                         <label for="convert_output_suffix">输出后缀</label>
@@ -367,7 +367,13 @@
                     <div class="form-group" id="convert_emit_path_colors_row">
                         <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-weight:600;">
                             <input type="checkbox" id="convert_emit_path_colors" name="emit_path_colors" checked>
-                            <span>在 .icon 中写入 PATH_COLOR_ARGB（关闭后由 Chromium 运行时上色）</span>
+                            <span>保留原图颜色（关闭后仍保留透明度，由 Chromium 运行时上色）</span>
+                        </label>
+                    </div>
+                    <div class="form-group" id="convert_allow_approximation_row">
+                        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-weight:600;">
+                            <input type="checkbox" id="convert_allow_approximation" name="allow_approximation">
+                            <span>近似复杂效果（可能损失细节并增大文件；默认遇到无法准确转换的效果时报错）</span>
                         </label>
                     </div>
                     <div class="preview-row" id="convert_preview_row" hidden>
@@ -548,6 +554,7 @@
             if (emitRow && select) {
                 const out = select.options[select.selectedIndex].value.toLowerCase();
                 emitRow.hidden = out !== '.icon';
+                document.getElementById('convert_allow_approximation_row').hidden = out !== '.icon';
             }
         }
 
@@ -566,11 +573,18 @@
             const outImg = document.getElementById('convert_out_thumb');
             const outBtn = document.getElementById('convert_out_thumb_btn');
             const ph = document.getElementById('convert_out_thumb_placeholder');
+            outImg.onload = null;
+            outImg.onerror = null;
             outImg.removeAttribute('src');
             outImg.hidden = true;
             ph.hidden = false;
             ph.textContent = '完成转换后显示预览';
             outBtn.disabled = true;
+        }
+
+        function showConvertOutputFailure() {
+            resetConvertOutputPreview();
+            document.getElementById('convert_out_thumb_placeholder').textContent = '转换失败，未更新输出';
         }
 
         function refreshConvertSourcePreview() {
@@ -649,6 +663,8 @@
             form.addEventListener('submit', async function (event) {
                 event.preventDefault();
                 setLoading('convertBtn', true);
+                resetConvertOutputPreview();
+                document.getElementById('convert_out_thumb_placeholder').textContent = '正在转换…';
                 try {
                     const formData = new FormData(event.target);
                     const file = formData.get('logo_path');
@@ -673,6 +689,9 @@
                         payload.emit_path_colors = document.getElementById(
                             'convert_emit_path_colors'
                         ).checked;
+                        payload.allow_approximation = document.getElementById(
+                            'convert_allow_approximation'
+                        ).checked;
                     }
 
                     const response = await fetch(`${API_BASE}/convert_image`, {
@@ -683,6 +702,7 @@
 
                     const raw = await response.text();
                     if (!response.ok) {
+                        showConvertOutputFailure();
                         showMessage(raw || '操作失败', false);
                         return;
                     }
@@ -729,6 +749,7 @@
                     }
                     showMessage(message || '操作成功', true);
                 } catch (error) {
+                    showConvertOutputFailure();
                     showMessage('错误: ' + error.message, false);
                 } finally {
                     setLoading('convertBtn', false);

@@ -1,21 +1,11 @@
-use axum::{Router, routing::get, routing::post};
-use axum::http::Method;
+use axum::{Router, routing::get, routing::post, middleware, extract::Request, response::{IntoResponse, Response}};
+use axum::http::{HeaderMap, StatusCode};
 use tower::limit::ConcurrencyLimitLayer;
-use tower_http::cors::{CorsLayer, Any};
 use crate::api::{AppState};
 use crate::api::handlers;
 use crate::api::ws;
 
 pub fn create_router(state: AppState) -> Router {
-    // 配置 CORS，确保正确处理预检请求
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers(Any)
-        .allow_credentials(false)
-        .expose_headers(Any)
-        .max_age(std::time::Duration::from_secs(3600));
-    
     Router::new()
         // OEM 路由（根路径默认进入 OEM 页面）
         .route("/", get(handlers::oem::oem_page))
@@ -66,7 +56,75 @@ pub fn create_router(state: AppState) -> Router {
         .route("/custom_args_list", get(handlers::config::custom_args_list))
         .route("/build_args_list", get(handlers::config::build_args_list))
         
-        // CORS 层应该在最后，确保所有路由都应用
-        .layer(cors)
+        .layer(middleware::from_fn(require_same_origin))
         .with_state(state)
+}
+
+fn request_origin_allowed(headers: &HeaderMap, allowed_hosts: &[String]) -> bool {
+    let Some(host) = headers.get("host").and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    if !allowed_hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(host)) {
+        return false;
+    }
+    if headers.get("sec-fetch-site").and_then(|v| v.to_str().ok())
+        .is_some_and(|site| !matches!(site, "same-origin" | "none")) {
+        return false;
+    }
+    if let Some(origin) = headers.get("origin") {
+        let Ok(origin) = origin.to_str() else { return false; };
+        let Ok(uri) = origin.parse::<axum::http::Uri>() else { return false; };
+        if uri.scheme_str() != Some("http")
+            || !uri.authority().is_some_and(|authority| authority.as_str().eq_ignore_ascii_case(host))
+            || uri.path_and_query().is_some_and(|path| path.as_str() != "/") {
+            return false;
+        }
+    }
+    true
+}
+
+async fn require_same_origin(request: Request, next: middleware::Next) -> Response {
+    let bind = std::env::var("CHROMIUM_TOOL_BIND").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    let Ok(bind) = bind.parse::<std::net::SocketAddr>() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid server bind address").into_response();
+    };
+    let mut hosts = vec![format!("localhost:{}", bind.port()), format!("127.0.0.1:{}", bind.port()), format!("[::1]:{}", bind.port())];
+    if !bind.ip().is_unspecified() {
+        hosts.push(bind.to_string());
+    }
+    // Explicit public bindings must also declare the hostnames clients will use.
+    if let Ok(extra) = std::env::var("CHROMIUM_TOOL_ALLOWED_HOSTS") {
+        hosts.extend(extra.split(',').map(str::trim).filter(|host| !host.is_empty()).map(str::to_string));
+    }
+    if !request_origin_allowed(request.headers(), &hosts) {
+        return (StatusCode::FORBIDDEN, "This endpoint requires the configured host and a same-origin request").into_response();
+    }
+    next.run(request).await
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    #[test]
+    fn local_requests_reject_cross_origin_and_rebound_hosts() {
+        let allowed = vec!["127.0.0.1:3000".to_string()];
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "127.0.0.1:3000".parse().unwrap());
+        assert!(request_origin_allowed(&headers, &allowed));
+        headers.insert("origin", "http://127.0.0.1:3000".parse().unwrap());
+        assert!(request_origin_allowed(&headers, &allowed));
+        headers.insert("origin", "https://127.0.0.1:3000".parse().unwrap());
+        assert!(!request_origin_allowed(&headers, &allowed));
+        headers.insert("origin", "null".parse().unwrap());
+        assert!(!request_origin_allowed(&headers, &allowed));
+        headers.insert("origin", "https://example.test".parse().unwrap());
+        assert!(!request_origin_allowed(&headers, &allowed));
+        headers.remove("origin");
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(!request_origin_allowed(&headers, &allowed));
+        headers.remove("sec-fetch-site");
+        headers.insert("host", "rebound.example:3000".parse().unwrap());
+        assert!(!request_origin_allowed(&headers, &allowed));
+    }
 }

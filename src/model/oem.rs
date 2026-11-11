@@ -11,6 +11,9 @@ pub struct ConvertRequest {
     /// 时不写入 `PATH_COLOR_ARGB`，由 Chromium 运行时模板色上色。
     #[serde(default)]
     pub emit_path_colors: Option<bool>,
+    /// 允许将渐变、裁剪和合成效果近似为路径；默认严格转换。
+    #[serde(default)]
+    pub allow_approximation: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -78,7 +78,15 @@ cargo build
 cargo run
 ```
 
-服务器将在 `0.0.0.0:3000` 启动。
+服务器默认在 `127.0.0.1:3000` 启动，访问 <http://127.0.0.1:3000>。
+可用 `CHROMIUM_TOOL_BIND` 显式修改监听地址；使用额外域名时，通过
+`CHROMIUM_TOOL_ALLOWED_HOSTS` 配置逗号分隔的 `主机名:端口`。
+这些配置不提供身份认证，远程部署需要自行配置访问控制。
+
+### 图像与图标转换
+
+支持 SVG → Chromium `.icon` / PNG、`.icon` → SVG，以及位图 / SVG → ICO / ICNS。
+格式支持范围、透明度与近似转换说明见 [CONVERSION.md](CONVERSION.md)。
 
 ### 配置
 
@@ -103,6 +111,5 @@ cargo run
 ## 注意事项
 
 - 项目保留了 `oem_tool` 和 `pkg_tool` 目录中的旧代码，后续可以逐步迁移
-- 编译时会有一些警告（主要是未使用的导入），不影响功能
 - 需要确保 `config.toml` 文件存在并配置正确
 
