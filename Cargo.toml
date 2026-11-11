@@ -92,6 +92,9 @@ md5 = "0.7"
 image = "0.25"
 resvg = "0.44"
 tiny-skia = "0.11"
+# Skia PathOps preserves curve geometry and SVG fill rules when flattening
+# binary vector masks. Default features provide supported prebuilt binaries.
+skia-safe = "0.90.0"
 icns = "0.3"
 ico = "0.3"
 pic-scale = "0.3"  # 保留旧代码依赖

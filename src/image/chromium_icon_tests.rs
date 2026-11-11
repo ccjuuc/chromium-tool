@@ -1,12 +1,12 @@
 use super::*;
 
-fn svg(body: &str) -> String {
+pub(super) fn svg(body: &str) -> String {
     format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">{body}</svg>"#
     )
 }
 
-fn render(source: &str) -> tiny_skia::Pixmap {
+pub(super) fn render(source: &str) -> tiny_skia::Pixmap {
     let tree = crate::image::svg_document::parse_svg(source).unwrap();
     let width = tree.size().width();
     let height = tree.size().height();
@@ -30,13 +30,13 @@ fn render(source: &str) -> tiny_skia::Pixmap {
     image
 }
 
-fn roundtrip(source: &str, options: SvgToChromiumIconOptions) -> (String, tiny_skia::Pixmap) {
+pub(super) fn roundtrip(source: &str, options: SvgToChromiumIconOptions) -> (String, tiny_skia::Pixmap) {
     let icon = try_convert_svg_source_to_chromium_icon(source, &options).unwrap();
     let markup = try_convert_chromium_icon_source_to_svg_markup(&icon).unwrap();
     (icon, render(&markup))
 }
 
-fn assert_equivalent(source: &str) -> (String, tiny_skia::Pixmap) {
+pub(super) fn assert_equivalent(source: &str) -> (String, tiny_skia::Pixmap) {
     let expected = render(source);
     let (icon, actual) = roundtrip(source, SvgToChromiumIconOptions::default());
     let difference: u64 = expected
@@ -183,8 +183,8 @@ fn unsupported_effects_require_explicit_approximation() {
     for body in [
         r##"<defs><clipPath id="c"><circle cx="8" cy="8" r="5"/></clipPath></defs><rect width="16" height="16" fill="red" clip-path="url(#c)"/>"##,
         r##"<defs><linearGradient id="g"><stop stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient></defs><rect x="2" y="2" width="12" height="12" fill="url(#g)"/>"##,
-        r##"<defs><mask id="m"><rect width="16" height="16" fill="white"/><circle cx="8" cy="8" r="3" fill="black"/></mask></defs><rect x="2" y="2" width="12" height="12" fill="red" mask="url(#m)"/>"##,
-        r#"<g opacity=".5"><rect x="2" y="2" width="8" height="8" fill="red"/><rect x="6" y="6" width="8" height="8" fill="blue"/></g>"#,
+        r##"<defs><mask id="m"><rect width="16" height="16" fill="white"/><circle cx="8" cy="8" r="3" fill="black" opacity=".5"/></mask></defs><rect x="2" y="2" width="12" height="12" fill="red" mask="url(#m)"/>"##,
+        r#"<g opacity=".5"><rect x="2" y="2" width="8" height="8" fill="red"/><rect x="6" y="6" width="8" height="8" fill="blue" fill-opacity=".5"/></g>"#,
     ] {
         let source = svg(body);
         let error =
@@ -317,4 +317,86 @@ fn approximation_preserves_template_alpha_and_blurred_masks() {
         .map(|(a, b)| u64::from(a.alpha().abs_diff(b.alpha())))
         .sum();
     assert!(alpha_difference as f64 / colored.pixels().len() as f64 <= 1.0);
+}
+
+#[test]
+fn checkbox_mask_converts_to_tintable_curves_and_preserves_source_opacity() {
+    let source = include_str!("fixtures/checkbox_inner_stroke.svg");
+    let (colored_icon, _) = assert_equivalent(source);
+    assert!(!colored_icon.contains("Sampled"));
+    assert!(!colored_icon.contains("Approximation"));
+    assert!(!colored_icon.contains("DISABLE_AA"));
+    assert!(colored_icon.len() < 5000);
+    let icon = try_convert_svg_source_to_chromium_icon(
+        source,
+        &SvgToChromiumIconOptions {
+            emit_path_colors: false,
+            approximate_effects: false,
+        },
+    )
+    .unwrap();
+    assert!(icon.contains("PATH_COLOR_ALPHA, 51,"));
+    assert!(!icon.contains("PATH_COLOR_ARGB"));
+    for theme in [[255, 0, 0, 128], [0, 0, 255, 255]] {
+        let markup = reverse::convert_with_color(&icon, None, theme).unwrap();
+        let image = render(&markup);
+        let edge = image.pixel(64, 4).unwrap().demultiply();
+        assert_eq!(
+            edge.alpha(),
+            51,
+            "SVG opacity intentionally overrides theme alpha"
+        );
+        assert_eq!(
+            (edge.red(), edge.green(), edge.blue()),
+            (theme[0], theme[1], theme[2])
+        );
+        assert_eq!(image.pixel(64, 64).unwrap().alpha(), 0);
+    }
+}
+
+#[test]
+fn opaque_templates_keep_colorid_alpha_and_checked_cutout() {
+    let source = include_str!("fixtures/checkbox_checked.svg");
+    let icon = try_convert_svg_source_to_chromium_icon(
+        source,
+        &SvgToChromiumIconOptions {
+            emit_path_colors: false,
+            approximate_effects: false,
+        },
+    )
+    .unwrap();
+    assert!(!icon.contains("PATH_COLOR"));
+    for theme in [[255, 0, 0, 128], [0, 0, 255, 64]] {
+        let markup = reverse::convert_with_color(&icon, None, theme).unwrap();
+        let image = render(&markup);
+        let body = image.pixel(64, 16).unwrap().demultiply();
+        assert_eq!(body.alpha(), theme[3]);
+        assert_eq!(
+            (body.red(), body.green(), body.blue()),
+            (theme[0], theme[1], theme[2])
+        );
+        assert_eq!(
+            image.pixel(56, 80).unwrap().alpha(),
+            0,
+            "tick remains a cutout"
+        );
+    }
+}
+
+#[test]
+fn approximation_does_not_force_opaque_template_alpha() {
+    let source = svg(
+        r##"<defs><linearGradient id="g"><stop stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient></defs><rect width="16" height="16" fill="url(#g)"/>"##,
+    );
+    let icon = try_convert_svg_source_to_chromium_icon(
+        &source,
+        &SvgToChromiumIconOptions {
+            emit_path_colors: false,
+            approximate_effects: true,
+        },
+    )
+    .unwrap();
+    assert!(!icon.contains("PATH_COLOR_ALPHA, 255,"));
+    let image = render(&reverse::convert_with_color(&icon, None, [255, 0, 0, 96]).unwrap());
+    assert_eq!(image.pixel(64, 64).unwrap().alpha(), 96);
 }

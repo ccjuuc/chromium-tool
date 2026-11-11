@@ -113,7 +113,7 @@ pub(super) fn flatten_tree(tree: &usvg::Tree, emit_path_colors: bool) -> Result<
                 color[3], color[0], color[1], color[2]
             )
             .unwrap();
-        } else {
+        } else if color[3] != 255 {
             writeln!(output, "PATH_COLOR_ALPHA, {},", color[3]).unwrap();
         }
         // Rectangles describe disjoint samples. Disable AA so shared edges do

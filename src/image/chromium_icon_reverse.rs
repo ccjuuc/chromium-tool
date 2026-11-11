@@ -186,6 +186,13 @@ impl Default for Path {
 }
 
 impl Path {
+    fn with_color(color: [u8; 4]) -> Self {
+        Self {
+            color,
+            ..Self::default()
+        }
+    }
+
     fn move_to(&mut self, p: Point) {
         write!(self.data, "M{} {} ", number(p.x), number(p.y)).unwrap();
         self.current = p;
@@ -393,6 +400,16 @@ fn flush(path: Path, canvas: f64, content: &mut String, defs: &mut String, mask_
 /// an explicit backdrop is only for a preview surface. RTL-dependent commands
 /// are rejected because no rendering direction is supplied by this interface.
 pub(super) fn convert(source: &str, backdrop: Option<&str>) -> Result<String, String> {
+    convert_with_color(source, backdrop, [0x42, 0x42, 0x42, 255])
+}
+
+/// Use the RGBA color supplied by the Chromium caller as each path's initial
+/// paint. PATH_COLOR_ALPHA replaces its alpha; PATH_COLOR_ARGB replaces RGBA.
+pub(super) fn convert_with_color(
+    source: &str,
+    backdrop: Option<&str>,
+    color: [u8; 4],
+) -> Result<String, String> {
     let commands = parse_commands(source)?;
     let start = commands
         .iter()
@@ -408,7 +425,7 @@ pub(super) fn convert(source: &str, backdrop: Option<&str>) -> Result<String, St
     } else {
         48.0
     };
-    let mut path = Path::default();
+    let mut path = Path::with_color(color);
     let mut content = String::new();
     let mut defs = String::new();
     let mut mask_count = 0;
@@ -420,7 +437,7 @@ pub(super) fn convert(source: &str, backdrop: Option<&str>) -> Result<String, St
         let mut curve = false;
         match command.name.as_str() {
             "CANVAS_DIMENSIONS" => {},
-            "NEW_PATH" => flush(std::mem::take(&mut path), canvas, &mut content, &mut defs, &mut mask_count),
+            "NEW_PATH" => flush(std::mem::replace(&mut path, Path::with_color(color)), canvas, &mut content, &mut defs, &mut mask_count),
             "FILL_RULE_NONZERO" => path.nonzero = true,
             "PATH_COLOR_ALPHA" => path.color[3] = channel(a[0])?,
             "PATH_COLOR_ARGB" => path.color = [channel(a[1])?, channel(a[2])?, channel(a[3])?, channel(a[0])?],
@@ -517,7 +534,11 @@ mod tests {
     }
 
     fn render_at(source: &str, size: u32) -> tiny_skia::Pixmap {
-        let markup = convert(source, None).unwrap();
+        render_with_color(source, size, [0x42, 0x42, 0x42, 255])
+    }
+
+    fn render_with_color(source: &str, size: u32, color: [u8; 4]) -> tiny_skia::Pixmap {
+        let markup = convert_with_color(source, None, color).unwrap();
         let tree = usvg::Tree::from_str(&markup, &usvg::Options::default()).unwrap();
         let mut image = tiny_skia::Pixmap::new(size, size).unwrap();
         let scale = size as f32 / tree.size().width();
@@ -527,6 +548,64 @@ mod tests {
             &mut image.as_mut(),
         );
         image
+    }
+
+    #[test]
+    fn template_rgba_is_inherited_until_explicitly_overridden() {
+        let theme = [20, 100, 220, 102];
+        let inherited = render_with_color("CANVAS_DIMENSIONS,16,CIRCLE,8,8,6", 16, theme);
+        assert_eq!(
+            inherited.pixel(8, 8).unwrap(),
+            tiny_skia::ColorU8::from_rgba(20, 100, 220, 102).premultiply()
+        );
+
+        let explicit_alpha = render_with_color(
+            "CANVAS_DIMENSIONS,16,PATH_COLOR_ALPHA,51,CIRCLE,8,8,6",
+            16,
+            theme,
+        );
+        assert_eq!(
+            explicit_alpha.pixel(8, 8).unwrap(),
+            tiny_skia::ColorU8::from_rgba(20, 100, 220, 51).premultiply()
+        );
+
+        let explicit_argb = render_with_color(
+            "CANVAS_DIMENSIONS,16,PATH_COLOR_ARGB,204,240,60,10,CIRCLE,8,8,6",
+            16,
+            theme,
+        );
+        assert_eq!(
+            explicit_argb.pixel(8, 8).unwrap(),
+            tiny_skia::ColorU8::from_rgba(240, 60, 10, 204).premultiply()
+        );
+    }
+
+    #[test]
+    fn new_path_restores_the_callers_rgba_after_paint_overrides() {
+        let image = render_with_color(
+            "CANVAS_DIMENSIONS,24,PATH_COLOR_ARGB,204,240,60,10,CIRCLE,4,12,3,NEW_PATH,PATH_COLOR_ALPHA,51,CIRCLE,12,12,3,NEW_PATH,CIRCLE,20,12,3",
+            24, [20, 100, 220, 102]);
+        for (x, rgba) in [
+            (4, [240, 60, 10, 204]),
+            (12, [20, 100, 220, 51]),
+            (20, [20, 100, 220, 102]),
+        ] {
+            assert_eq!(
+                image.pixel(x, 12).unwrap(),
+                tiny_skia::ColorU8::from_rgba(rgba[0], rgba[1], rgba[2], rgba[3]).premultiply()
+            );
+        }
+    }
+
+    #[test]
+    fn theme_color_and_alpha_do_not_fill_compound_path_holes() {
+        let image = render_with_color(
+            "CANVAS_DIMENSIONS,16,ROUND_RECT,0,0,16,16,4,ROUND_RECT,1,1,14,14,3",
+            160,
+            [20, 100, 220, 102],
+        );
+        assert_eq!(image.pixel(80, 80).unwrap().alpha(), 0);
+        assert_eq!(image.pixel(80, 5).unwrap().alpha(), 102);
     }
 
     #[test]

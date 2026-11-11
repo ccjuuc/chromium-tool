@@ -5,8 +5,14 @@ use std::fmt::Write;
 use std::path::Path;
 use tiny_skia::{Path as VectorPath, PathSegment, Rect, Transform};
 
+#[path = "chromium_icon_compositing.rs"]
+mod compositing;
 #[path = "chromium_icon_effects.rs"]
 mod effects;
+#[path = "chromium_icon_filter.rs"]
+mod filter;
+#[path = "chromium_icon_mask.rs"]
+mod mask;
 #[path = "chromium_icon_reverse.rs"]
 mod reverse;
 
@@ -49,11 +55,117 @@ enum ConversionError {
 
 type ConversionResult<T> = Result<T, ConversionError>;
 
-fn solid_color(paint: &usvg::Paint) -> ConversionResult<usvg::Color> {
-    match paint {
-        usvg::Paint::Color(color) => Ok(*color),
-        _ => Err(ConversionError::Effect("渐变或图案填充")),
+/// Machine-readable failure category, independent of the translated message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IconConversionErrorKind {
+    RequiresApproximation,
+    Failed,
+}
+
+impl IconConversionErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RequiresApproximation => "requires_approximation",
+            Self::Failed => "conversion_failed",
+        }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct IconConversionError {
+    pub kind: IconConversionErrorKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for IconConversionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for IconConversionError {}
+
+impl From<String> for IconConversionError {
+    fn from(message: String) -> Self {
+        Self {
+            kind: IconConversionErrorKind::Failed,
+            message,
+        }
+    }
+}
+
+impl From<&str> for IconConversionError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PaintPolicy {
+    Original,
+    Template,
+}
+
+fn paint_color_and_alpha(
+    paint: &usvg::Paint,
+    policy: PaintPolicy,
+) -> ConversionResult<(usvg::Color, f32)> {
+    let stops = match paint {
+        usvg::Paint::Color(color) => {
+            return Ok((
+                match policy {
+                    PaintPolicy::Original => *color,
+                    PaintPolicy::Template => usvg::Color::black(),
+                },
+                1.0,
+            ))
+        }
+        usvg::Paint::LinearGradient(gradient) => {
+            if gradient.transform().invert().is_none() {
+                return Err(ConversionError::Effect("退化变换的渐变"));
+            }
+            gradient.stops()
+        }
+        usvg::Paint::RadialGradient(gradient) => {
+            if gradient.transform().invert().is_none() {
+                return Err(ConversionError::Effect("退化变换的渐变"));
+            }
+            // A focal point on/outside the outer circle can leave unpainted
+            // regions even with constant stop alpha. Do not fill those holes.
+            let focal_distance =
+                (gradient.fx() - gradient.cx()).hypot(gradient.fy() - gradient.cy());
+            // Match the radial shader's near-zero/near-circle tolerance;
+            // otherwise a nearly degenerate cone can gain opaque regions.
+            const RADIAL_TOLERANCE: f32 = 1.0 / 4096.0;
+            if gradient.r().get() <= RADIAL_TOLERANCE {
+                return Err(ConversionError::Effect("退化半径的径向渐变"));
+            }
+            if focal_distance > 0.0 && gradient.r().get() / focal_distance <= 1.0 + RADIAL_TOLERANCE
+            {
+                return Err(ConversionError::Effect("焦点位于边界或外部的径向渐变"));
+            }
+            gradient.stops()
+        }
+        usvg::Paint::Pattern(_) => return Err(ConversionError::Effect("图案填充")),
+    };
+    if matches!(policy, PaintPolicy::Original) {
+        return Err(ConversionError::Effect(
+            "彩色渐变（保留原图颜色时需要渐变着色器）",
+        ));
+    }
+    let alpha = stops
+        .first()
+        .ok_or_else(|| ConversionError::Invalid("渐变没有颜色节点".into()))?
+        .opacity()
+        .get();
+    if stops.iter().any(|stop| stop.opacity().get() != alpha) {
+        return Err(ConversionError::Effect(
+            "透明度渐变（模板颜色无法表示空间变化的透明度）",
+        ));
+    }
+    // Template mode deliberately replaces source RGB, but never its alpha.
+    // Mask collection always uses Original so luminance keeps its true meaning.
+    Ok((usvg::Color::black(), alpha))
 }
 
 // Chromium CLIP is one global axis-aligned rectangle, not a path-local state.
@@ -120,23 +232,36 @@ fn collect_path(
     clip: Rect,
     layers: &mut Vec<Layer>,
 ) -> ConversionResult<()> {
+    collect_path_with_policy(path, transform, clip, PaintPolicy::Original, layers)
+}
+
+fn collect_path_with_policy(
+    path: &usvg::Path,
+    transform: Transform,
+    clip: Rect,
+    policy: PaintPolicy,
+    layers: &mut Vec<Layer>,
+) -> ConversionResult<()> {
     if !path.is_visible() {
         return Ok(());
     }
     let mut fill_layer = None;
     if let Some(fill) = path.fill().filter(|fill| fill.opacity().get() > 0.0) {
-        fill_layer = Some(Layer {
-            path: transformed(path.data().clone(), transform)?,
-            color: solid_color(fill.paint())?,
-            alpha: fill.opacity().get(),
-            rule: fill.rule(),
-            clip,
-            antialias: path.rendering_mode().use_shape_antialiasing(),
-        });
+        let (color, paint_alpha) = paint_color_and_alpha(fill.paint(), policy)?;
+        if paint_alpha > 0.0 {
+            fill_layer = Some(Layer {
+                path: transformed(path.data().clone(), transform)?,
+                color,
+                alpha: fill.opacity().get() * paint_alpha,
+                rule: fill.rule(),
+                clip,
+                antialias: path.rendering_mode().use_shape_antialiasing(),
+            });
+        }
     }
     let mut stroke_layer = None;
     if let Some(stroke) = path.stroke().filter(|stroke| stroke.opacity().get() > 0.0) {
-        let color = solid_color(stroke.paint())?;
+        let (color, paint_alpha) = paint_color_and_alpha(stroke.paint(), policy)?;
         let mut style = stroke.to_tiny_skia();
         let resolution_scale =
             tiny_skia::PathStroker::compute_resolution_scale(&transform).max(1.0) * 8.0;
@@ -147,13 +272,14 @@ fn collect_path(
         } else {
             Some(path.data().clone())
         };
-        if let Some(outline) =
-            geometry.and_then(|geometry| geometry.stroke(&style, resolution_scale))
+        if let Some(outline) = geometry
+            .and_then(|geometry| geometry.stroke(&style, resolution_scale))
+            .filter(|_| paint_alpha > 0.0)
         {
             stroke_layer = Some(Layer {
                 path: transformed(outline, transform)?,
                 color,
-                alpha: stroke.opacity().get(),
+                alpha: stroke.opacity().get() * paint_alpha,
                 rule: usvg::FillRule::NonZero,
                 clip,
                 antialias: path.rendering_mode().use_shape_antialiasing(),
@@ -175,6 +301,7 @@ fn collect_layers(
     group: &usvg::Group,
     parent_transform: Transform,
     inherited_clip: Rect,
+    policy: PaintPolicy,
     layers: &mut Vec<Layer>,
 ) -> ConversionResult<()> {
     // Accumulate the instance's group transforms, as resvg does. usvg's cached
@@ -183,12 +310,7 @@ fn collect_layers(
     if group.opacity().get() == 0.0 {
         return Ok(());
     }
-    if group.mask().is_some() {
-        return Err(ConversionError::Effect("蒙版"));
-    }
-    if !group.filters().is_empty() {
-        return Err(ConversionError::Effect("滤镜"));
-    }
+    let filter_region = filter::region(group, transform)?;
     if group.blend_mode() != usvg::BlendMode::Normal {
         return Err(ConversionError::Effect("混合模式"));
     }
@@ -203,21 +325,38 @@ fn collect_layers(
     let start = layers.len();
     for child in group.children() {
         match child {
-            usvg::Node::Group(child) => collect_layers(child, transform, clip, layers)?,
-            usvg::Node::Path(path) => collect_path(path, transform, clip, layers)?,
+            usvg::Node::Group(child) => collect_layers(child, transform, clip, policy, layers)?,
+            usvg::Node::Path(path) => {
+                collect_path_with_policy(path, transform, clip, policy, layers)?
+            }
             usvg::Node::Image(_) => return Err(ConversionError::Effect("嵌入式位图")),
             usvg::Node::Text(_) => {
                 return Err(ConversionError::Invalid("请先将文字转为路径".into()))
             }
         }
     }
+    if let Some(region) = filter_region {
+        region.apply(layers, start)?;
+    }
+    if let Some(mask) = group.mask() {
+        let geometry = mask::geometry(mask, transform)?;
+        let original_layers: Vec<_> = layers.drain(start..).collect();
+        for mut layer in original_layers {
+            if let Some((path, rule)) = super::vector_path_ops::combine(
+                Some((&layer.path, layer.rule)),
+                geometry.as_ref().map(|(path, rule)| (path, *rule)),
+                super::vector_path_ops::Operation::Intersect,
+            )
+            .map_err(ConversionError::Invalid)?
+            {
+                layer.path = path;
+                layer.rule = rule;
+                layers.push(layer);
+            }
+        }
+    }
     if group.opacity().get() < 1.0 {
-        if layers.len() - start > 1 {
-            return Err(ConversionError::Effect("多图层组透明度"));
-        }
-        for layer in &mut layers[start..] {
-            layer.alpha *= group.opacity().get();
-        }
+        compositing::apply_group_opacity(layers, start, group.opacity().get(), clip)?;
     }
     Ok(())
 }
@@ -255,7 +394,18 @@ fn emit_tree(tree: &usvg::Tree, options: &SvgToChromiumIconOptions) -> Conversio
     }
     let viewport = Rect::from_xywh(0.0, 0.0, width, height).unwrap();
     let mut layers = Vec::new();
-    collect_layers(tree.root(), Transform::identity(), viewport, &mut layers)?;
+    let policy = if options.emit_path_colors {
+        PaintPolicy::Original
+    } else {
+        PaintPolicy::Template
+    };
+    collect_layers(
+        tree.root(),
+        Transform::identity(),
+        viewport,
+        policy,
+        &mut layers,
+    )?;
     let mut global_clip = viewport;
     for layer in &layers {
         global_clip = global_clip
@@ -292,7 +442,9 @@ fn emit_tree(tree: &usvg::Tree, options: &SvgToChromiumIconOptions) -> Conversio
                 layer.color.red, layer.color.green, layer.color.blue
             )
             .unwrap();
-        } else {
+        } else if alpha != 255 {
+            // Chromium starts each path with the caller's full color, including
+            // alpha. Writing 255 would override a translucent ColorId.
             writeln!(output, "PATH_COLOR_ALPHA, {alpha},").unwrap();
         }
         if layer.rule == usvg::FillRule::NonZero {
@@ -309,20 +461,30 @@ fn emit_tree(tree: &usvg::Tree, options: &SvgToChromiumIconOptions) -> Conversio
     Ok(output)
 }
 
-pub fn try_convert_svg_source_to_chromium_icon(
+#[cfg(test)]
+fn try_convert_svg_source_to_chromium_icon(
     source: &str,
     options: &SvgToChromiumIconOptions,
 ) -> Result<String, String> {
+    try_convert_svg_source_to_chromium_icon_detailed(source, options).map_err(|error| error.message)
+}
+
+pub fn try_convert_svg_source_to_chromium_icon_detailed(
+    source: &str,
+    options: &SvgToChromiumIconOptions,
+) -> Result<String, IconConversionError> {
     let tree = super::svg_document::parse_svg(source)?;
-    match emit_tree(&tree, options) {
+    match filter::validate_source(source, &tree).and_then(|()| emit_tree(&tree, options)) {
         Ok(icon) => Ok(icon),
-        Err(ConversionError::Invalid(error)) => Err(error),
+        Err(ConversionError::Invalid(error)) => Err(error.into()),
         Err(ConversionError::Effect(effect)) if options.approximate_effects => {
             let icon = effects::flatten_tree(&tree, options.emit_path_colors)?;
             Ok(format!("// Approximation requested: {effect}\n{icon}"))
         }
-        Err(ConversionError::Effect(effect)) => Err(format!(
-            "SVG 包含无法等价表示为 Chromium .icon 的{effect}；请简化为普通路径，或显式启用“近似复杂效果”")),
+        Err(ConversionError::Effect(effect)) => Err(IconConversionError {
+            kind: IconConversionErrorKind::RequiresApproximation,
+            message: format!("需要近似转换：SVG 包含当前无法直接表示为 Chromium .icon 的{effect}；可简化源图，或显式启用“近似复杂效果”"),
+        }),
     }
 }
 
@@ -331,6 +493,15 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
     output_path: &str,
     options: &SvgToChromiumIconOptions,
 ) -> Result<String, String> {
+    try_convert_svg_to_chromium_icon_detailed(svg_path, output_path, options)
+        .map_err(|error| error.message)
+}
+
+pub fn try_convert_svg_to_chromium_icon_detailed(
+    svg_path: &str,
+    output_path: &str,
+    options: &SvgToChromiumIconOptions,
+) -> Result<String, IconConversionError> {
     let source = Path::new(svg_path);
     let target = source
         .parent()
@@ -343,7 +514,7 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
         return Err("转换输出不能覆盖源 SVG".into());
     }
     let content = std::fs::read_to_string(source).map_err(|e| format!("读取 SVG 失败: {e}"))?;
-    let icon = try_convert_svg_source_to_chromium_icon(&content, options)?;
+    let icon = try_convert_svg_source_to_chromium_icon_detailed(&content, options)?;
     super::image_util::write_output_atomic(&target, icon.as_bytes())?;
     Ok(target.to_string_lossy().into_owned())
 }
@@ -388,3 +559,19 @@ pub fn try_convert_chromium_icon_path_to_svg_markup_with_backdrop(
 #[cfg(test)]
 #[path = "chromium_icon_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "chromium_icon_mask_tests.rs"]
+mod mask_tests;
+
+#[cfg(test)]
+#[path = "chromium_icon_compositing_tests.rs"]
+mod compositing_tests;
+
+#[cfg(test)]
+#[path = "chromium_icon_filter_tests.rs"]
+mod filter_tests;
+
+#[cfg(test)]
+#[path = "chromium_icon_gradient_tests.rs"]
+mod gradient_tests;

@@ -237,11 +237,12 @@
                     近似复杂效果
                 </label>
                 <button type="button" class="btn" id="batchConvertBtn">SVG 全部 → .icon 并预览</button>
+                <button type="button" class="btn" id="retryApproximationBtn" hidden>仅近似重试待处理项</button>
                 <button type="button" class="btn" id="refreshBtn">仅刷新预览</button>
             </div>
             <p class="hint">
-                工作目录可直接填写、从历史中选择，或点「选择目录…」。最近使用的 10 个目录保存在当前浏览器中。点「SVG 全部 → .icon」会枚举该目录下所有 <code>.svg</code>，在同目录生成 <code>.icon</code>。取消勾选「保留原图颜色」后由 Chromium 运行时统一上色，仍保留透明度。
-                默认遇到无法准确转换的效果时报错；勾选「近似复杂效果」可尝试保留遮罩、模糊等外观，但可能损失细节并增大文件。关闭颜色只影响上色方式，不会自动删除原图背景。服务重启后，请重新选择目录或执行转换，再刷新该目录的预览。
+                工作目录可直接填写、从历史中选择，或点「选择目录…」。最近使用的 10 个目录保存在当前浏览器中。点「SVG 全部 → .icon」会枚举该目录下所有 <code>.svg</code>，在同目录生成 <code>.icon</code>。取消勾选「保留原图颜色」后跟随运行时颜色；不透明路径继承主题透明度，源图半透明路径使用自身透明度，透明孔洞仍保持镂空。
+                默认将无法准确转换的效果标记为「需要近似转换」，可单独近似重试这些文件；近似可能损失细节并增大文件。勾选「近似复杂效果」会允许本次全部转换使用近似。关闭颜色只影响上色方式，不会自动删除原图背景。服务重启后，请重新选择目录或执行转换，再刷新该目录的预览。
             </p>
             <p id="dirPath" aria-live="polite"></p>
         </div>
@@ -260,6 +261,7 @@
             var scanRootInput = document.getElementById('scanRoot');
             var refreshBtn = document.getElementById('refreshBtn');
             var batchConvertBtn = document.getElementById('batchConvertBtn');
+            var retryApproximationBtn = document.getElementById('retryApproximationBtn');
             var selectDirectoryBtn = document.getElementById('selectDirectoryBtn');
             var scanRootHistory = document.getElementById('scanRootHistory');
             var iconList = document.getElementById('iconList');
@@ -281,6 +283,35 @@
             var emitPathColorsStorageKey = 'iconPreviewEmitPathColors';
             var batchConversionDirectory = '';
             var batchConversionErrors = Object.create(null);
+            var batchBusy = false;
+            var listRequestId = 0;
+
+            function errorLabel(error) {
+                return error.code === 'requires_approximation' ? '需要近似转换' : '转换失败';
+            }
+
+            function approximationFiles() {
+                if (scanRootInput.value.trim() !== batchConversionDirectory) return [];
+                return Object.keys(batchConversionErrors).filter(function (name) {
+                    return batchConversionErrors[name].code === 'requires_approximation';
+                }).map(function (name) { return batchConversionErrors[name].file; });
+            }
+
+            function updateApproximationRetry() {
+                var count = approximationFiles().length;
+                retryApproximationBtn.hidden = count === 0;
+                retryApproximationBtn.disabled = batchBusy;
+                retryApproximationBtn.textContent = '仅近似重试 ' + count + ' 项';
+            }
+
+            function setBatchBusy(busy) {
+                batchBusy = busy;
+                [batchConvertBtn, refreshBtn, selectDirectoryBtn, scanRootInput,
+                    emitPathColorsInput, allowApproximationInput].forEach(function (control) {
+                    control.disabled = busy;
+                });
+                updateApproximationRetry();
+            }
 
             function restoreEmitPathColors() {
                 try {
@@ -327,7 +358,9 @@
             }
 
             async function selectDirectory() {
-                selectDirectoryBtn.disabled = true;
+                if (batchBusy) return;
+                ++listRequestId;
+                setBatchBusy(true);
                 loadErr.hidden = true;
                 try {
                     var res = await fetch('/icon_preview_select_directory', {
@@ -345,7 +378,7 @@
                     loadErr.textContent = '选择目录失败：' + e.message;
                     loadErr.hidden = false;
                 } finally {
-                    selectDirectoryBtn.disabled = false;
+                    setBatchBusy(false);
                 }
             }
 
@@ -452,7 +485,7 @@
                     if (conversionError) {
                         var failure = document.createElement('span');
                         failure.className = 'preview-missing';
-                        failure.textContent = '转换失败';
+                        failure.textContent = errorLabel(conversionError);
                         failure.title = conversionError.message;
                         convCell.appendChild(failure);
                     } else {
@@ -508,26 +541,32 @@
                 });
             }
 
-            async function batchConvertAndPreview() {
+            async function batchConvertAndPreview(retryOnly) {
+                if (batchBusy) return;
                 var trimmed = scanRootInput.value.trim();
                 if (!trimmed) {
                     loadErr.textContent = '请先在「工作目录」填写要批量转换的文件夹路径。';
                     loadErr.hidden = false;
                     return;
                 }
+                var selectedFiles = retryOnly ? approximationFiles() : null;
+                if (retryOnly && selectedFiles.length === 0) return;
+                var previousSummaryVisible = !batchSummary.hidden && batchConversionDirectory === trimmed;
                 loadErr.hidden = true;
                 batchSummary.hidden = true;
-                batchConvertBtn.disabled = true;
-                refreshBtn.disabled = true;
+                ++listRequestId;
+                setBatchBusy(true);
                 try {
+                    var request = {
+                        directory: trimmed,
+                        emit_path_colors: emitPathColorsInput.checked,
+                        allow_approximation: retryOnly || allowApproximationInput.checked,
+                    };
+                    if (retryOnly) request.files = selectedFiles;
                     var res = await fetch('/icon_preview_batch_convert', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            directory: trimmed,
-                            emit_path_colors: emitPathColorsInput.checked,
-                            allow_approximation: allowApproximationInput.checked,
-                        }),
+                        body: JSON.stringify(request),
                     });
                     var raw = await res.text();
                     var data = null;
@@ -535,34 +574,47 @@
                         data = raw ? JSON.parse(raw) : null;
                     } catch (ignore) {}
                     if (!res.ok) {
-                        throw new Error(raw || ('HTTP ' + res.status));
+                        throw new Error(data && data.message || raw || ('HTTP ' + res.status));
                     }
-                    batchConversionDirectory = data.directory || trimmed;
-                    batchConversionErrors = Object.create(null);
+                    var resultDirectory = data.directory || trimmed;
+                    if (!retryOnly || batchConversionDirectory !== resultDirectory) {
+                        batchConversionErrors = Object.create(null);
+                    } else {
+                        selectedFiles.forEach(function (file) {
+                            delete batchConversionErrors[file.replace(/\.svg$/i, '.icon')];
+                        });
+                    }
+                    batchConversionDirectory = resultDirectory;
+                    scanRootInput.value = resultDirectory;
+                    (data.converted || []).forEach(function (name) { delete batchConversionErrors[name]; });
                     (data.errors || []).forEach(function (error) {
                         var iconName = error.file.replace(/\.svg$/i, '.icon');
                         batchConversionErrors[iconName] = error;
                     });
                     batchSummary.textContent = data.summary || '';
-                    if (data.errors && data.errors.length) {
+                    var pending = Object.keys(batchConversionErrors).map(function (name) {
+                        return batchConversionErrors[name];
+                    });
+                    if (pending.length) {
                         batchSummary.textContent +=
-                            '\n\n失败明细：\n' +
-                            data.errors.map(function (e) {
-                                return e.file + ': ' + e.message;
+                            '\n\n待处理明细：\n' +
+                            pending.map(function (e) {
+                                return e.file + ' [' + errorLabel(e) + ']: ' + e.message;
                             }).join('\n');
                     }
                     batchSummary.hidden = false;
                     await fetchList();
                 } catch (e) {
+                    if (previousSummaryVisible) batchSummary.hidden = false;
                     loadErr.textContent = '批量转换失败：' + e.message;
                     loadErr.hidden = false;
                 } finally {
-                    batchConvertBtn.disabled = false;
-                    refreshBtn.disabled = false;
+                    setBatchBusy(false);
                 }
             }
 
             async function fetchList() {
+                var requestId = ++listRequestId;
                 loadErr.hidden = true;
                 emptyEl.hidden = true;
                 iconList.innerHTML = '';
@@ -576,15 +628,18 @@
                     var res = await fetch(url);
                     if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text().catch(function () { return ''; })));
                     var data = await res.json();
+                    if (requestId !== listRequestId || trimmedRoot !== scanRootInput.value.trim()) return;
                     canonicalRootForQuery = ((data.directory || '') + '').trim();
                     if (canonicalRootForQuery !== batchConversionDirectory) {
                         batchConversionErrors = Object.create(null);
                         batchConversionDirectory = '';
+                        batchSummary.hidden = true;
                     }
                     if (canonicalRootForQuery) {
                         scanRootInput.value = canonicalRootForQuery;
                         rememberDirectory(canonicalRootForQuery);
                     }
+                    updateApproximationRetry();
                     dirPath.textContent = data.directory ? '当前目录：' + data.directory : '';
                     var icons = (data.icons || []).slice();
                     var originals = data.originals || {};
@@ -601,6 +656,7 @@
                     emptyEl.hidden = true;
                     render(icons, originals);
                 } catch (e) {
+                    if (requestId !== listRequestId || trimmedRoot !== scanRootInput.value.trim()) return;
                     loadErr.textContent = '加载列表失败：' + e.message;
                     loadErr.hidden = false;
                     useRootQuery = false;
@@ -621,9 +677,14 @@
             scanRootInput.addEventListener('keydown', function (ev) {
                 if (ev.key === 'Enter') fetchList();
             });
+            scanRootInput.addEventListener('input', function () {
+                updateApproximationRetry();
+                if (scanRootInput.value.trim() !== batchConversionDirectory) batchSummary.hidden = true;
+            });
 
             refreshBtn.addEventListener('click', fetchList);
-            batchConvertBtn.addEventListener('click', batchConvertAndPreview);
+            batchConvertBtn.addEventListener('click', function () { batchConvertAndPreview(false); });
+            retryApproximationBtn.addEventListener('click', function () { batchConvertAndPreview(true); });
             selectDirectoryBtn.addEventListener('click', selectDirectory);
             emitPathColorsInput.addEventListener('change', rememberEmitPathColors);
             restoreEmitPathColors();

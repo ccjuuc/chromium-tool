@@ -401,12 +401,22 @@ pub struct IconPreviewBatchConvertRequest {
     pub emit_path_colors: Option<bool>,
     #[serde(default)]
     pub allow_approximation: bool,
+    /// 省略时转换全部 SVG；指定时只转换这些单层 SVG 文件名。
+    #[serde(default)]
+    pub files: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
 pub struct IconPreviewBatchConvertItemError {
     pub file: String,
+    pub code: &'static str,
     pub message: String,
+}
+
+impl IconPreviewBatchConvertItemError {
+    fn new(file: String, error: chromium_icon::IconConversionError) -> Self {
+        Self { file, code: error.kind.as_str(), message: error.message }
+    }
 }
 
 #[derive(Serialize)]
@@ -419,7 +429,7 @@ pub struct IconPreviewBatchConvertResponse {
     pub summary: String,
 }
 
-/// 将用户指定目录下全部 `*.svg` 转为同目录下的 `同名.icon`，再供批量预览页展示。
+/// 将用户指定目录下全部或选定的 `*.svg` 转为同目录下的 `同名.icon`。
 ///
 /// 目录必须显式传入；**不会**用环境变量代替用户输入。转换完成后由前端再请求 [`list_icon_preview_files`]。
 pub async fn icon_preview_batch_convert(
@@ -447,32 +457,10 @@ fn convert_icon_directory(body: IconPreviewBatchConvertRequest) -> axum::respons
     };
     let dir_str = display_icon_preview_directory(&root);
 
-    let read_dir = match std::fs::read_dir(&root) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("read dir: {}", e),
-            )
-                .into_response();
-        }
+    let svg_files = match batch_svg_files(&root, body.files.as_deref()) {
+        Ok(files) => files,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-
-    let mut svg_files: Vec<std::path::PathBuf> = Vec::new();
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let is_svg = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"));
-        if is_svg {
-            svg_files.push(path);
-        }
-    }
-    svg_files.sort();
 
     let svg_found = svg_files.len();
     let mut converted: Vec<String> = Vec::new();
@@ -486,34 +474,25 @@ fn convert_icon_directory(body: IconPreviewBatchConvertRequest) -> axum::respons
         let stem = match path.file_stem().and_then(|s| s.to_str()) {
             Some(s) => s,
             None => {
-                errors.push(IconPreviewBatchConvertItemError {
-                    file: fname,
-                    message: "无法解析文件名".to_string(),
-                });
+                errors.push(IconPreviewBatchConvertItemError::new(fname, "无法解析文件名".into()));
                 continue;
             }
         };
         let out_basename = format!("{}.icon", stem);
         if let Err(message) = resolve_preview_asset(&root, &fname)
             .and_then(|_| checked_output_path(&root, &out_basename)) {
-            errors.push(IconPreviewBatchConvertItemError {
-                file: fname,
-                message,
-            });
+            errors.push(IconPreviewBatchConvertItemError::new(fname, message.into()));
             continue;
         }
         let svg_path_str = match path.to_str() {
             Some(s) => s.to_string(),
             None => {
-                errors.push(IconPreviewBatchConvertItemError {
-                    file: fname,
-                    message: "路径含非法字符".to_string(),
-                });
+                errors.push(IconPreviewBatchConvertItemError::new(fname, "路径含非法字符".into()));
                 continue;
             }
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            chromium_icon::try_convert_svg_to_chromium_icon_with_options(
+            chromium_icon::try_convert_svg_to_chromium_icon_detailed(
                 &svg_path_str,
                 &out_basename,
                 &icon_opts,
@@ -521,19 +500,20 @@ fn convert_icon_directory(body: IconPreviewBatchConvertRequest) -> axum::respons
         }));
         match result {
             Ok(Ok(_)) => converted.push(out_basename),
-            Ok(Err(msg)) => errors.push(IconPreviewBatchConvertItemError { file: fname, message: msg }),
-            Err(_) => errors.push(IconPreviewBatchConvertItemError {
-                file: fname,
-                message: "转换过程 panic".to_string(),
-            }),
+            Ok(Err(error)) => errors.push(IconPreviewBatchConvertItemError::new(fname, error)),
+            Err(_) => errors.push(IconPreviewBatchConvertItemError::new(fname, "转换过程 panic".into())),
         }
     }
 
+    let requires_approximation = errors.iter().filter(|error|
+        error.code == chromium_icon::IconConversionErrorKind::RequiresApproximation.as_str()
+    ).count();
     let summary = format!(
-        "目录内 SVG {} 个，成功生成 .icon {} 个，失败 {} 个",
+        "本次处理 SVG {} 个，成功 {} 个，需要近似转换 {} 个，失败 {} 个",
         svg_found,
         converted.len(),
-        errors.len()
+        requires_approximation,
+        errors.len() - requires_approximation
     );
 
     Json(IconPreviewBatchConvertResponse {
@@ -546,10 +526,53 @@ fn convert_icon_directory(body: IconPreviewBatchConvertRequest) -> axum::respons
     .into_response()
 }
 
+fn batch_svg_files(root: &std::path::Path, selected: Option<&[String]>) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    if let Some(selected) = selected {
+        if selected.is_empty() {
+            return Err("请选择需要转换的 SVG 文件".into());
+        }
+        // Validate the entire selection before writing anything. An invalid
+        // basename must not turn a targeted retry into a directory-wide run.
+        for name in selected {
+            let name = sanitize_convert_output_basename(name).map_err(str::to_string)?;
+            if !std::path::Path::new(&name).extension().and_then(|value| value.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("svg")) {
+                return Err("仅能选择 SVG 源文件".into());
+            }
+            resolve_preview_asset(root, &name)?;
+            files.push(root.join(name));
+        }
+    } else {
+        for entry in std::fs::read_dir(root).map_err(|error| format!("无法读取目录: {error}"))? {
+            let path = entry.map_err(|error| format!("无法读取目录项: {error}"))?.path();
+            if path.is_file() && path.extension().and_then(|value| value.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("svg")) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
 #[derive(Serialize)]
 struct ConvertImageOk {
     message: String,
     preview_name: String,
+}
+
+#[derive(Serialize)]
+struct ConvertImageError {
+    code: &'static str,
+    message: String,
+}
+
+impl From<chromium_icon::IconConversionError> for ConvertImageError {
+    fn from(error: chromium_icon::IconConversionError) -> Self {
+        Self { code: error.kind.as_str(), message: error.message }
+    }
 }
 
 fn validate_conversion_request(payload: &ConvertRequest) -> Result<(String, String, String), String> {
@@ -606,7 +629,7 @@ impl Drop for ConversionStaging {
     }
 }
 
-fn run_image_conversion(payload: ConvertRequest) -> Result<ConvertImageOk, String> {
+fn run_image_conversion(payload: ConvertRequest) -> Result<ConvertImageOk, chromium_icon::IconConversionError> {
     let work_dir = convert_work_dir().map_err(|e| e.to_string())?;
     run_image_conversion_in_directory(payload, &work_dir)
 }
@@ -646,7 +669,7 @@ fn publish_conversion(
 fn run_image_conversion_in_directory(
     payload: ConvertRequest,
     work_dir: &std::path::Path,
-) -> Result<ConvertImageOk, String> {
+) -> Result<ConvertImageOk, chromium_icon::IconConversionError> {
     // Validate every name/format before creating or replacing any output.
     let (original_name, output_name, format) = validate_conversion_request(&payload)?;
     let logo_data = STANDARD.decode(&payload.logo_data).map_err(|e| format!("Invalid base64 data: {e}"))?;
@@ -666,7 +689,7 @@ fn run_image_conversion_in_directory(
     match format.as_str() {
         "ICO" => { image_util::try_generate_chromium_ico(input_str, &output_name)?; }
         "ICNS" => { image_util::try_generate_chromium_icns(input_str, &output_name, true)?; }
-        "ICON" => { chromium_icon::try_convert_svg_to_chromium_icon_with_options(input_str, &output_name, &icon_options)?; }
+        "ICON" => { chromium_icon::try_convert_svg_to_chromium_icon_detailed(input_str, &output_name, &icon_options)?; }
         "PNG" => { svg_png::try_convert_svg_to_png(input_str, &output_name)?; }
         "SVG" => {
             let svg = chromium_icon::try_convert_chromium_icon_path_to_svg_markup(input_str)?;
@@ -690,10 +713,12 @@ fn run_image_conversion_in_directory(
 pub async fn convert_image(Json(payload): Json<ConvertRequest>) -> impl IntoResponse {
     match tokio::task::spawn_blocking(move || run_image_conversion(payload)).await {
         Ok(Ok(result)) => (StatusCode::OK, Json(result)).into_response(),
-        Ok(Err(error)) => (StatusCode::BAD_REQUEST, error).into_response(),
+        Ok(Err(error)) => (StatusCode::BAD_REQUEST, Json(ConvertImageError::from(error))).into_response(),
         Err(error) => {
             tracing::error!("conversion worker failed: {error}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "转换任务失败，原输出已保留").into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ConvertImageError::from(
+                chromium_icon::IconConversionError::from("转换任务失败，原输出已保留")
+            ))).into_response()
         }
     }
 }
@@ -898,6 +923,92 @@ mod tests {
         assert_eq!(std::fs::read(original).unwrap(), b"previous original");
         assert_eq!(std::fs::read(output).unwrap(), b"previous output");
         assert_eq!(std::fs::read_dir(&temporary.0).unwrap().count(), 2);
+    }
+
+    const GRADIENT_SOURCE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><defs><linearGradient id="paint"><stop stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient></defs><rect width="16" height="16" fill="url(#paint)"/></svg>"##;
+
+    #[test]
+    fn upload_retains_error_classification_and_existing_artifacts() {
+        let temporary = ConversionStaging::new(&std::env::temp_dir()).unwrap();
+        let original = temporary.0.join("image-ori.svg");
+        let output = temporary.0.join("result.icon");
+        std::fs::write(&original, b"previous original").unwrap();
+        std::fs::write(&output, b"previous output").unwrap();
+        for (source, code) in [(GRADIENT_SOURCE, "requires_approximation"), ("not SVG", "conversion_failed")] {
+            let mut request = conversion_request("image.svg", "result.icon", "ICON");
+            request.logo_data = STANDARD.encode(source);
+            let error = run_image_conversion_in_directory(request, &temporary.0).err().unwrap();
+            let json = serde_json::to_value(ConvertImageError::from(error)).unwrap();
+            assert_eq!(json["code"], code);
+            assert!(json["message"].as_str().is_some_and(|message| !message.is_empty()));
+            assert_eq!(std::fs::read(&original).unwrap(), b"previous original");
+            assert_eq!(std::fs::read(&output).unwrap(), b"previous output");
+        }
+    }
+
+    fn batch_request(root: &std::path::Path, files: Option<Vec<String>>, approximate: bool) -> IconPreviewBatchConvertRequest {
+        IconPreviewBatchConvertRequest {
+            directory: root.to_string_lossy().into_owned(),
+            emit_path_colors: Some(true),
+            allow_approximation: approximate,
+            files,
+        }
+    }
+
+    async fn batch_json(request: IconPreviewBatchConvertRequest) -> serde_json::Value {
+        let response = convert_icon_directory(request);
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn targeted_retry_only_rewrites_selected_svg_outputs() {
+        let temporary = ConversionStaging::new(&std::env::temp_dir()).unwrap();
+        let root = &temporary.0;
+        std::fs::write(root.join("gradient.svg"), GRADIENT_SOURCE).unwrap();
+        std::fs::write(root.join("good.svg"), r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16"/></svg>"#).unwrap();
+        std::fs::write(root.join("bad.svg"), "not SVG").unwrap();
+        std::fs::write(root.join("gradient.icon"), b"old gradient").unwrap();
+        std::fs::write(root.join("bad.icon"), b"old invalid output").unwrap();
+        let strict = batch_json(batch_request(root, None, false)).await;
+        assert_eq!(strict["svg_found"], 3);
+        assert_eq!(strict["converted"], serde_json::json!(["good.icon"]));
+        let errors = strict["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().any(|error| error["file"] == "gradient.svg" && error["code"] == "requires_approximation"));
+        assert!(errors.iter().any(|error| error["file"] == "bad.svg" && error["code"] == "conversion_failed"));
+        assert_eq!(std::fs::read(root.join("gradient.icon")).unwrap(), b"old gradient");
+        // A previously successful result must not be regenerated during retry.
+        std::fs::write(root.join("good.icon"), b"keep successful output").unwrap();
+        let retry = batch_json(batch_request(root, Some(vec!["gradient.svg".into(), "gradient.svg".into()]), true)).await;
+        assert_eq!(retry["svg_found"], 1);
+        assert_eq!(retry["converted"], serde_json::json!(["gradient.icon"]));
+        assert_eq!(retry["errors"], serde_json::json!([]));
+        assert!(std::fs::read_to_string(root.join("gradient.icon")).unwrap().contains("Approximation requested"));
+        assert_eq!(std::fs::read(root.join("good.icon")).unwrap(), b"keep successful output");
+        assert_eq!(std::fs::read(root.join("bad.icon")).unwrap(), b"old invalid output");
+        assert_eq!(std::fs::read_to_string(root.join("gradient.svg")).unwrap(), GRADIENT_SOURCE);
+        registered_preview_directories().write().unwrap().remove(&canonical_directory(root).unwrap());
+    }
+
+    #[test]
+    fn invalid_retry_selection_is_rejected_before_any_conversion() {
+        let temporary = ConversionStaging::new(&std::env::temp_dir()).unwrap();
+        let root = &temporary.0;
+        std::fs::write(root.join("chosen.svg"), GRADIENT_SOURCE).unwrap();
+        std::fs::write(root.join("chosen.icon"), b"unchanged").unwrap();
+        for selected in [
+            vec![],
+            vec!["chosen.svg".into(), "../outside.svg".into()],
+            vec!["chosen.svg".into(), "chosen.icon".into()],
+            vec!["chosen.svg".into(), "missing.svg".into()],
+        ] {
+            let response = convert_icon_directory(batch_request(root, Some(selected), true));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(std::fs::read(root.join("chosen.icon")).unwrap(), b"unchanged");
+        }
+        registered_preview_directories().write().unwrap().remove(&canonical_directory(root).unwrap());
     }
 
     #[test]

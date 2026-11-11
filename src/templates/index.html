@@ -367,7 +367,7 @@
                     <div class="form-group" id="convert_emit_path_colors_row">
                         <label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-weight:600;">
                             <input type="checkbox" id="convert_emit_path_colors" name="emit_path_colors" checked>
-                            <span>保留原图颜色（关闭后仍保留透明度，由 Chromium 运行时上色）</span>
+                            <span>保留原图颜色（关闭后跟随运行时颜色；源图半透明度仍保留）</span>
                         </label>
                     </div>
                     <div class="form-group" id="convert_allow_approximation_row">
@@ -582,9 +582,10 @@
             outBtn.disabled = true;
         }
 
-        function showConvertOutputFailure() {
+        function showConvertOutputFailure(code) {
             resetConvertOutputPreview();
-            document.getElementById('convert_out_thumb_placeholder').textContent = '转换失败，未更新输出';
+            document.getElementById('convert_out_thumb_placeholder').textContent =
+                code === 'requires_approximation' ? '需要近似转换，未更新输出' : '转换失败，未更新输出';
         }
 
         function refreshConvertSourcePreview() {
@@ -702,8 +703,12 @@
 
                     const raw = await response.text();
                     if (!response.ok) {
-                        showConvertOutputFailure();
-                        showMessage(raw || '操作失败', false);
+                        let failure = null;
+                        try { failure = JSON.parse(raw); } catch (_) {}
+                        const code = failure && failure.code;
+                        const message = failure && failure.message || raw || '操作失败';
+                        showConvertOutputFailure(code);
+                        showMessage(message, false);
                         return;
                     }
 
