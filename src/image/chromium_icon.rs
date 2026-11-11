@@ -2600,6 +2600,103 @@ pub fn try_convert_svg_to_chromium_icon(
     )
 }
 
+/// Decode fragment URLs without interpreting `+` as a space.
+fn decode_svg_fragment(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(a), Some(b)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                decoded.push((a * 16 + b) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_string())
+}
+
+/// usvg's IRI parser rejects spaces in fragment IDs. Give those targets safe
+/// aliases as well as decoding hrefs; decoding only the href silently loses use
+/// instances. XML attribute ranges keep entity escaping and other markup intact.
+fn prepare_svg_instance_references(content: &str) -> Result<String, String> {
+    let document = usvg::roxmltree::Document::parse(content)
+        .map_err(|e| format!("SVG 引用解析失败: {}", e))?;
+    let mut ids: std::collections::HashSet<String> = document.descendants()
+        .filter_map(|node| node.attribute("id").map(str::to_string))
+        .collect();
+    let referenced: std::collections::HashSet<String> = document.descendants()
+        .flat_map(|node| node.attributes())
+        .filter(|attr| attr.name() == "href")
+        .filter_map(|attr| attr.value().strip_prefix('#').map(decode_svg_fragment))
+        .collect();
+    let mut aliases = std::collections::HashMap::new();
+    for node in document.descendants() {
+        if let Some(id) = node.attribute("id").filter(|id| {
+            id.contains(char::is_whitespace) && referenced.contains(*id)
+        }) {
+            let mut index = aliases.len();
+            let alias = loop {
+                let candidate = format!("chromium_tool_instance_{index}");
+                if ids.insert(candidate.clone()) {
+                    break candidate;
+                }
+                index += 1;
+            };
+            aliases.entry(id.to_string()).or_insert(alias);
+        }
+    }
+    let resolve = |fragment: &str| {
+        let decoded = decode_svg_fragment(fragment);
+        aliases.get(&decoded).cloned().unwrap_or(decoded)
+    };
+    let url = regex::Regex::new(r##"url\(\s*['"]?#([^'")]+)['"]?\s*\)"##).unwrap();
+    let replace_urls = |value: &str| {
+        url.replace_all(value, |caps: &regex::Captures<'_>| {
+            let id = decode_svg_fragment(caps[1].trim());
+            aliases.get(&id).map(|alias| format!("url(#{alias})"))
+                .unwrap_or_else(|| caps[0].to_string())
+        }).into_owned()
+    };
+    let mut edits = Vec::new();
+    for node in document.descendants() {
+        for attr in node.attributes() {
+            let value = attr.value();
+            let replacement = if attr.name() == "id" {
+                aliases.get(value).cloned().unwrap_or_else(|| value.to_string())
+            } else if attr.name() == "href" && value.starts_with('#') {
+                format!("#{}", resolve(&value[1..]))
+            } else {
+                replace_urls(value)
+            };
+            if replacement != value {
+                let escaped = replacement.replace('&', "&amp;").replace('<', "&lt;")
+                    .replace('"', "&quot;").replace('\'', "&apos;");
+                edits.push((attr.range_value(), escaped));
+            }
+        }
+        if node.is_text() && node.parent().is_some_and(|p| p.has_tag_name("style")) {
+            let value = node.text().unwrap_or_default();
+            let replacement = replace_urls(value);
+            if replacement != value {
+                edits.push((node.range(), replacement.replace('&', "&amp;").replace('<', "&lt;")));
+            }
+        }
+    }
+    let mut prepared = content.to_string();
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    for (range, replacement) in edits {
+        prepared.replace_range(range, &replacement);
+    }
+    Ok(prepared)
+}
+
 /// 出错友好版的 SVG -> .icon 转换（可选是否写入 `PATH_COLOR_ARGB`）。
 pub fn try_convert_svg_to_chromium_icon_with_options(
     svg_path: &str,
@@ -2608,9 +2705,19 @@ pub fn try_convert_svg_to_chromium_icon_with_options(
 ) -> Result<String, String> {
     let emit_path_colors = options.emit_path_colors;
     let mut content = String::new();
-    let events = svg::open(svg_path, &mut content)
+    let mut events = svg::open(svg_path, &mut content)
         .map_err(|e| format!("Failed to open/parse SVG '{}': {}", svg_path, e))?
         .collect::<Vec<_>>();
+
+    // Resolve SVG instances (including Figma's percent-encoded fragment IDs)
+    // before walking geometry. usvg expands references and preserves transforms.
+    if events.iter().any(|event| matches!(event, Event::Tag("use", Type::Start | Type::Empty, _))) {
+        let prepared = prepare_svg_instance_references(&content)?;
+        let tree = usvg::Tree::from_str(&prepared, &usvg::Options::default())
+            .map_err(|e| format!("SVG 引用展开失败: {}", e))?;
+        content = tree.to_string(&usvg::WriteOptions::default());
+        events = svg::Parser::new(&content).collect();
+    }
 
     let gradient_colors = collect_svg_gradient_colors(&events);
     let mode = validate_svg_vector_convertible(&events, &gradient_colors)?;
@@ -3521,6 +3628,56 @@ pub fn convert_chromium_icon_to_svg(icon_path: &str, output_path: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn figma_use_instances_preserve_all_sun_rays() {
+        let dir = std::env::temp_dir().join(format!("sun_use_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("sun.svg");
+        std::fs::write(&source, include_str!("fixtures/light_mode_use.svg")).unwrap();
+        for emit_path_colors in [true, false] {
+            let output = super::try_convert_svg_to_chromium_icon_with_options(
+                source.to_str().unwrap(), "sun.icon", &SvgToChromiumIconOptions { emit_path_colors },
+            ).unwrap();
+            let icon = std::fs::read_to_string(output).unwrap();
+            assert!(!icon.contains("Sampling:"), "instances should remain vector geometry");
+            let preview = super::try_convert_chromium_icon_source_to_svg_markup(&icon).unwrap();
+            let tree = usvg::Tree::from_str(&preview, &usvg::Options::default()).unwrap();
+            let mut image = tiny_skia::Pixmap::new(160, 160).unwrap();
+            resvg::render(&tree, tiny_skia::Transform::from_scale(10.0, 10.0), &mut image.as_mut());
+            let is_dark = |x, y| {
+                let pixel = image.pixel(x, y).unwrap().demultiply();
+                pixel.alpha() > 128 && pixel.red() < 128 && pixel.green() < 128 && pixel.blue() < 128
+            };
+            for (x, y) in [(80, 10), (130, 30), (150, 80), (130, 130), (80, 150), (30, 130), (10, 80), (30, 30)] {
+                let visible = ((y - 5)..=(y + 5)).any(|py| ((x - 5)..=(x + 5)).any(|px| is_dark(px, py)));
+                assert!(visible, "missing sun ray at ({x}, {y}): {icon}");
+            }
+            assert!(!is_dark(80, 80), "sun center must remain hollow");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn use_references_handle_entities_nested_instances_and_id_collisions() {
+        let source = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="16" height="16">
+<use href="#copy" x="8"/>
+<defs>
+  <rect id="chromium_tool_instance_0" width="2" height="2" fill="blue"/>
+  <g id="ray &amp; plus+"><rect width="2" height="2" fill="red"/></g>
+  <g id="copy"><use xlink:href="#ray%20%26%20plus%2B"/></g>
+</defs>
+<use href="#ray &amp; plus+" y="8"/>
+</svg>"##;
+        let prepared = prepare_svg_instance_references(source).unwrap();
+        let tree = usvg::Tree::from_str(&prepared, &usvg::Options::default()).unwrap();
+        let mut image = tiny_skia::Pixmap::new(16, 16).unwrap();
+        resvg::render(&tree, tiny_skia::Transform::identity(), &mut image.as_mut());
+        for (x, y) in [(9, 1), (1, 9)] {
+            let pixel = image.pixel(x, y).unwrap().demultiply();
+            assert_eq!((pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()), (255, 0, 0, 255));
+        }
+        assert_eq!(image.pixel(1, 1).unwrap().alpha(), 0, "defs must not paint");
+    }
     #[test]
     fn info_background_opacity_survives_icon_roundtrip() {
         let dir = std::env::temp_dir().join(format!("info_opacity_{}", std::process::id()));

@@ -1,7 +1,12 @@
+#[cfg(target_os = "macos")]
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use anyhow::{Result, Context};
+#[cfg(target_os = "macos")]
 use crate::service::build::installer::InstallerBuilder;
+#[cfg(target_os = "macos")]
 use tokio::fs;
+#[cfg(target_os = "macos")]
 use tokio::process::Command;
 
 #[cfg(target_os = "macos")]

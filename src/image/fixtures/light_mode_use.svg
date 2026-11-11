@@ -1,0 +1,20 @@
+<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<g clip-path="url(#clip0_17634_17739)">
+<circle cx="8" cy="8" r="4.5" stroke="#1F2530"/>
+<g id="Repeat group 1_inner" data-figma-trr="r8u7-0f">
+<rect x="7.51562" y="0.015625" width="1" height="2" fill="#1F2530"/>
+</g>
+<use xlink:href="#Repeat%20group%201_inner" transform="translate(8.01561 -3.32017) rotate(45)"/>
+<use xlink:href="#Repeat%20group%201_inner" transform="translate(16.0312) rotate(90)"/>
+<use xlink:href="#Repeat%20group%201_inner" transform="translate(19.3514 8.01561) rotate(135)"/>
+<use xlink:href="#Repeat%20group%201_inner" transform="translate(16.0312 16.0312) rotate(-180)"/>
+<use xlink:href="#Repeat%20group%201_inner" transform="translate(8.01561 19.3514) rotate(-135)"/>
+<use xlink:href="#Repeat%20group%201_inner" transform="translate(-1.25388e-07 16.0312) rotate(-90)"/>
+<use xlink:href="#Repeat%20group%201_inner" transform="translate(-3.32017 8.01561) rotate(-45)"/>
+</g>
+<defs>
+<clipPath id="clip0_17634_17739">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</svg>

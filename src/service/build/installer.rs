@@ -113,6 +113,9 @@ impl InstallerBuilder {
     }
     
     pub async fn build_installer(&self, src_path: &Path, out_dir: &str, installer_format: Option<&str>) -> Result<()> {
+        #[cfg(not(target_os = "macos"))]
+        let _ = installer_format;
+
         // 先执行 ninja 构建 installer/mac（生成打包工具和目录）
         self.run_ninja(
             src_path,
@@ -142,44 +145,16 @@ impl InstallerBuilder {
     }
     
     
-    // Helper to generate background
-    #[cfg(target_os = "macos")]
-
-
-
-
-
-    /// 创建 macOS DMG 安装包
-    #[cfg(target_os = "macos")]
     /// 创建 macOS DMG 安装包
     #[cfg(target_os = "macos")]
     async fn create_dmg(&self, src_path: &Path, out_dir: &str) -> Result<()> {
         crate::service::build::dmg::create(self, src_path, out_dir).await
     }
     
-    #[cfg(not(target_os = "macos"))]
-    async fn create_dmg(&self, _src_path: &Path, _out_dir: &str) -> Result<()> {
-        Ok(())
-    }
-    
-    /// 创建 macOS PKG 安装包（仅 macOS）
-    #[cfg(target_os = "macos")]
     /// 创建 macOS PKG 安装包（仅 macOS）
     #[cfg(target_os = "macos")]
     async fn create_pkg(&self, src_path: &Path, out_dir: &str) -> Result<()> {
         crate::service::build::pkg::create(self, src_path, out_dir).await
-    }
-    
-    #[cfg(not(target_os = "macos"))]
-    async fn create_pkg(&self, _src_path: &Path, _out_dir: &str) -> Result<()> {
-        Ok(())
-    }
-    
-
-    
-    #[cfg(not(target_os = "macos"))]
-    async fn generate_pkg_name(&self, _src_path: &Path, _out_dir: &str, _app_name: &str) -> Result<String> {
-        Err(anyhow::anyhow!("仅支持 macOS"))
     }
     
     /// 查找 .app 文件名（优先查找主应用，排除 Helper 应用）
@@ -230,11 +205,6 @@ impl InstallerBuilder {
         } else {
             Err(anyhow::anyhow!("在 {} 中找不到 .app 文件", out_path.display()))
         }
-    }
-    
-    #[cfg(not(target_os = "macos"))]
-    async fn find_app_name(&self, _src_path: &Path, _out_dir: &str) -> Result<String> {
-        Err(anyhow::anyhow!("仅支持 macOS"))
     }
     
     
@@ -291,11 +261,6 @@ impl InstallerBuilder {
         Err(anyhow::anyhow!("无法从 Info.plist 读取版本号"))
     }
     
-    #[cfg(not(target_os = "macos"))]
-    async fn read_version_from_info_plist(&self, _src_path: &Path, _out_dir: &str, _app_name: &str) -> Result<String> {
-        Err(anyhow::anyhow!("仅支持 macOS"))
-    }
-    
     /// 从 Info.plist 读取 Bundle ID（使用 plutil 命令）
     #[cfg(target_os = "macos")]
     pub(crate) async fn read_bundle_id_from_info_plist(&self, src_path: &Path, out_dir: &str, app_name: &str) -> Result<String> {
@@ -329,17 +294,8 @@ impl InstallerBuilder {
         Err(anyhow::anyhow!("无法从 Info.plist 读取 Bundle ID"))
     }
     
-    #[cfg(not(target_os = "macos"))]
-    async fn read_bundle_id_from_info_plist(&self, _src_path: &Path, _out_dir: &str, _app_name: &str) -> Result<String> {
-        Err(anyhow::anyhow!("仅支持 macOS"))
-    }
-    
-    #[cfg(not(target_os = "macos"))]
-    async fn generate_dmg_name(&self, _src_path: &Path, _out_dir: &str, _app_name: &str) -> Result<String> {
-        Err(anyhow::anyhow!("仅支持 macOS"))
-    }
-    
     // 辅助函数：迭代复制目录（避免递归）
+    #[cfg(target_os = "macos")]
     async fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         use tokio::fs;
         use std::collections::VecDeque;
